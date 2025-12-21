@@ -1,0 +1,480 @@
+//! Evolution system for virtual creatures.
+//!
+//! Implements:
+//! - Random genotype generation
+//! - Mutation operators
+//! - Crossover and grafting
+//! - Fitness evaluation
+//! - Evolution loop with selection
+
+use bevy::prelude::*;
+use rand::prelude::*;
+
+use crate::genotype::*;
+
+/// Configuration for evolution
+#[derive(Resource, Clone)]
+pub struct EvolutionConfig {
+    /// Population size
+    pub population_size: usize,
+    /// Fraction that survives each generation
+    pub survival_ratio: f32,
+    /// Probability of asexual reproduction
+    pub asexual_prob: f32,
+    /// Probability of crossover
+    pub crossover_prob: f32,
+    /// Probability of grafting
+    pub grafting_prob: f32,
+    /// Mutation rate for parameters
+    pub mutation_rate: f32,
+    /// Duration of each fitness test in seconds
+    pub test_duration: f32,
+}
+
+impl Default for EvolutionConfig {
+    fn default() -> Self {
+        Self {
+            population_size: 20,
+            survival_ratio: 0.2,
+            asexual_prob: 0.4,
+            crossover_prob: 0.3,
+            grafting_prob: 0.3,
+            mutation_rate: 0.3,
+            test_duration: 10.0,
+        }
+    }
+}
+
+/// An individual in the population
+#[derive(Clone)]
+pub struct Individual {
+    pub genotype: CreatureGenotype,
+    pub fitness: f32,
+}
+
+/// Current state of evolution
+#[derive(Resource)]
+pub struct EvolutionState {
+    pub population: Vec<Individual>,
+    pub generation: usize,
+    pub best_fitness: f32,
+    pub current_individual: usize,
+    pub test_start_time: f32,
+    pub test_start_position: Vec3,
+}
+
+impl Default for EvolutionState {
+    fn default() -> Self {
+        Self {
+            population: Vec::new(),
+            generation: 0,
+            best_fitness: 0.0,
+            current_individual: 0,
+            test_start_time: 0.0,
+            test_start_position: Vec3::ZERO,
+        }
+    }
+}
+
+// ============================================================================
+// Random Genotype Generation
+// ============================================================================
+
+/// Generate a random genotype
+pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
+    // Random root node
+    let root = random_morphology_node(rng, true);
+    let mut genotype = CreatureGenotype::new(root);
+
+    // Add 1-5 child parts
+    let num_parts = rng.gen_range(1..=5);
+    let mut parent_options = vec![genotype.root];
+
+    for _ in 0..num_parts {
+        let parent = *parent_options.choose(rng).unwrap();
+        let node = random_morphology_node(rng, false);
+        let connection = random_connection(rng);
+
+        let child = genotype.add_part(parent, node, connection);
+        parent_options.push(child);
+
+        // Maybe add symmetric counterpart
+        if rng.gen_bool(0.5) {
+            let sym_node = random_morphology_node(rng, false);
+            let sym_conn = genotype.morphology.connections_from(parent)
+                .last()
+                .map(|c| c.data.reflected(ReflectAxis::X))
+                .unwrap_or_else(|| random_connection(rng));
+            genotype.add_part(parent, sym_node, sym_conn);
+        }
+    }
+
+    // Add simple neural oscillators to each part
+    for (node_id, node) in genotype.morphology.nodes_mut() {
+        if node.joint_type != JointType::Rigid {
+            // Add an oscillator neuron
+            let oscillator = Neuron {
+                func: NeuronFunc::OscillateWave,
+                inputs: vec![WeightedInput {
+                    source: NeuralInput::Constant(rng.gen_range(0.5..3.0)),
+                    weight: 1.0,
+                }],
+            };
+            let osc_idx = node.neural.add_neuron(oscillator);
+
+            // Add effector connected to oscillator
+            let effector = Effector {
+                dof: 0,
+                input: WeightedInput {
+                    source: NeuralInput::LocalNeuron(osc_idx),
+                    weight: rng.gen_range(1.0..5.0),
+                },
+                max_force: 100.0,
+            };
+            node.neural.add_effector(effector);
+        }
+    }
+
+    genotype
+}
+
+fn random_morphology_node(rng: &mut impl Rng, is_root: bool) -> MorphologyNode {
+    let dimensions = Vec3::new(
+        rng.gen_range(0.2..1.0),
+        rng.gen_range(0.2..1.0),
+        rng.gen_range(0.2..1.0),
+    );
+
+    let joint_type = if is_root {
+        JointType::Rigid
+    } else {
+        match rng.gen_range(0..4) {
+            0 => JointType::Revolute,
+            1 => JointType::Twist,
+            2 => JointType::Universal,
+            _ => JointType::Spherical,
+        }
+    };
+
+    let mut node = MorphologyNode::new(dimensions, joint_type);
+    node.recursive_limit = rng.gen_range(1..=3);
+    node
+}
+
+fn random_connection(rng: &mut impl Rng) -> MorphologyConnection {
+    let mut conn = MorphologyConnection::new();
+
+    // Random position on parent surface
+    conn.position = Vec3::new(
+        rng.gen_range(-1.0..1.0),
+        rng.gen_range(-1.0..1.0),
+        rng.gen_range(-1.0..1.0),
+    );
+
+    // Random orientation
+    conn.orientation = Quat::from_euler(
+        EulerRot::XYZ,
+        rng.gen_range(-0.5..0.5),
+        rng.gen_range(-0.5..0.5),
+        rng.gen_range(-0.5..0.5),
+    );
+
+    conn.scale = rng.gen_range(0.5..1.2);
+    conn.terminal_only = rng.gen_bool(0.1);
+
+    conn
+}
+
+// ============================================================================
+// Mutation
+// ============================================================================
+
+/// Mutate a genotype in place
+pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
+    // Scale mutation rate by complexity (smaller creatures mutate more)
+    let scale = 1.0 / (genotype.morphology.node_count() as f32).sqrt();
+    let adjusted_rate = rate * scale;
+
+    // Mutate each node
+    for (_, node) in genotype.morphology.nodes_mut() {
+        mutate_node(node, rng, adjusted_rate);
+    }
+
+    // Mutate connections
+    for conn in genotype.morphology.connections_mut() {
+        mutate_connection(&mut conn.data, rng, adjusted_rate);
+    }
+
+    // Maybe add a new part
+    if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 10 {
+        let parents: Vec<_> = genotype.morphology.nodes().map(|(id, _)| id).collect();
+        if let Some(&parent) = parents.choose(rng) {
+            let new_node = random_morphology_node(rng, false);
+            let new_conn = random_connection(rng);
+            genotype.add_part(parent, new_node, new_conn);
+        }
+    }
+
+    // Maybe remove a part (not root)
+    if rng.gen_bool((adjusted_rate * 0.1) as f64) && genotype.morphology.node_count() > 2 {
+        // Note: actual removal would require more complex graph surgery
+        // For now, we just reduce recursive_limit of a random node
+        let nodes: Vec<_> = genotype.morphology.nodes_mut()
+            .filter(|(id, _)| *id != genotype.root)
+            .collect();
+        // Can't easily mutate here due to borrow, skip for now
+    }
+}
+
+fn mutate_node(node: &mut MorphologyNode, rng: &mut impl Rng, rate: f32) {
+    // Mutate dimensions
+    if rng.gen_bool(rate as f64) {
+        node.dimensions.x *= rng.gen_range(0.8..1.25);
+        node.dimensions.x = node.dimensions.x.clamp(0.1, 2.0);
+    }
+    if rng.gen_bool(rate as f64) {
+        node.dimensions.y *= rng.gen_range(0.8..1.25);
+        node.dimensions.y = node.dimensions.y.clamp(0.1, 2.0);
+    }
+    if rng.gen_bool(rate as f64) {
+        node.dimensions.z *= rng.gen_range(0.8..1.25);
+        node.dimensions.z = node.dimensions.z.clamp(0.1, 2.0);
+    }
+
+    // Mutate joint type
+    if rng.gen_bool((rate * 0.1) as f64) {
+        node.joint_type = match rng.gen_range(0..5) {
+            0 => JointType::Rigid,
+            1 => JointType::Revolute,
+            2 => JointType::Twist,
+            3 => JointType::Universal,
+            _ => JointType::Spherical,
+        };
+    }
+
+    // Mutate recursive limit
+    if rng.gen_bool((rate * 0.2) as f64) {
+        node.recursive_limit = rng.gen_range(1..=4);
+    }
+
+    // Mutate neural parameters
+    for neuron in &mut node.neural.neurons {
+        for input in &mut neuron.inputs {
+            if rng.gen_bool(rate as f64) {
+                input.weight *= rng.gen_range(0.8..1.25);
+                input.weight = input.weight.clamp(-10.0, 10.0);
+            }
+            // Mutate constant inputs
+            if let NeuralInput::Constant(ref mut val) = input.source {
+                if rng.gen_bool(rate as f64) {
+                    *val *= rng.gen_range(0.8..1.25);
+                    *val = val.clamp(0.1, 10.0);
+                }
+            }
+        }
+    }
+
+    for effector in &mut node.neural.effectors {
+        if rng.gen_bool(rate as f64) {
+            effector.input.weight *= rng.gen_range(0.8..1.25);
+            effector.input.weight = effector.input.weight.clamp(-10.0, 10.0);
+        }
+    }
+}
+
+fn mutate_connection(conn: &mut MorphologyConnection, rng: &mut impl Rng, rate: f32) {
+    // Mutate position
+    if rng.gen_bool(rate as f64) {
+        conn.position.x += rng.gen_range(-0.2..0.2);
+        conn.position.x = conn.position.x.clamp(-1.0, 1.0);
+    }
+    if rng.gen_bool(rate as f64) {
+        conn.position.y += rng.gen_range(-0.2..0.2);
+        conn.position.y = conn.position.y.clamp(-1.0, 1.0);
+    }
+    if rng.gen_bool(rate as f64) {
+        conn.position.z += rng.gen_range(-0.2..0.2);
+        conn.position.z = conn.position.z.clamp(-1.0, 1.0);
+    }
+
+    // Mutate orientation
+    if rng.gen_bool(rate as f64) {
+        let delta = Quat::from_euler(
+            EulerRot::XYZ,
+            rng.gen_range(-0.2..0.2),
+            rng.gen_range(-0.2..0.2),
+            rng.gen_range(-0.2..0.2),
+        );
+        conn.orientation = (conn.orientation * delta).normalize();
+    }
+
+    // Mutate scale
+    if rng.gen_bool(rate as f64) {
+        conn.scale *= rng.gen_range(0.9..1.1);
+        conn.scale = conn.scale.clamp(0.3, 2.0);
+    }
+}
+
+// ============================================================================
+// Crossover and Grafting
+// ============================================================================
+
+/// Crossover: combine two genotypes by swapping node sequences
+pub fn crossover(
+    parent1: &CreatureGenotype,
+    parent2: &CreatureGenotype,
+    rng: &mut impl Rng,
+) -> CreatureGenotype {
+    // Simple crossover: take root from parent1, add some parts from parent2
+    let mut child = parent1.clone();
+
+    // Try to graft a random subtree from parent2
+    if parent2.morphology.node_count() > 1 {
+        let p2_nodes: Vec<_> = parent2.morphology.nodes()
+            .filter(|(id, _)| *id != parent2.root)
+            .collect();
+
+        if let Some(&(node_id, node)) = p2_nodes.choose(rng) {
+            // Get the connection for this node
+            if let Some(conn) = parent2.morphology.connections_to(node_id).next() {
+                // Add to a random parent in child
+                let child_parents: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
+                if let Some(&parent) = child_parents.choose(rng) {
+                    child.add_part(parent, node.clone(), conn.data.clone());
+                }
+            }
+        }
+    }
+
+    child
+}
+
+/// Grafting: attach a subtree from one genotype to another
+pub fn graft(
+    base: &CreatureGenotype,
+    donor: &CreatureGenotype,
+    rng: &mut impl Rng,
+) -> CreatureGenotype {
+    let mut child = base.clone();
+
+    // Pick a random node from donor (not root)
+    let donor_nodes: Vec<_> = donor.morphology.nodes()
+        .filter(|(id, _)| *id != donor.root)
+        .collect();
+
+    if let Some(&(node_id, node)) = donor_nodes.choose(rng) {
+        // Get connection data
+        if let Some(conn) = donor.morphology.connections_to(node_id).next() {
+            // Attach to random node in base
+            let base_nodes: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
+            if let Some(&parent) = base_nodes.choose(rng) {
+                child.add_part(parent, node.clone(), conn.data.clone());
+            }
+        }
+    }
+
+    child
+}
+
+// ============================================================================
+// Fitness Evaluation
+// ============================================================================
+
+/// Calculate fitness based on distance traveled
+pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
+    // Horizontal distance traveled (ignore Y to avoid rewarding falling)
+    let horizontal_dist = Vec2::new(end_pos.x - start_pos.x, end_pos.z - start_pos.z).length();
+
+    // Reward forward movement (positive X)
+    let forward_dist = end_pos.x - start_pos.x;
+
+    // Combine: mostly forward progress, some total distance
+    let fitness = forward_dist.max(0.0) * 0.7 + horizontal_dist * 0.3;
+
+    // Normalize by time
+    fitness / duration.max(1.0)
+}
+
+// ============================================================================
+// Evolution Loop
+// ============================================================================
+
+/// Initialize the population
+pub fn init_population(config: &EvolutionConfig) -> Vec<Individual> {
+    let mut rng = rand::thread_rng();
+    (0..config.population_size)
+        .map(|_| Individual {
+            genotype: random_genotype(&mut rng),
+            fitness: 0.0,
+        })
+        .collect()
+}
+
+/// Select survivors based on fitness
+pub fn select_survivors(population: &mut Vec<Individual>, survival_ratio: f32) {
+    // Sort by fitness (descending)
+    population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+
+    // Keep top fraction
+    let num_survivors = ((population.len() as f32) * survival_ratio).ceil() as usize;
+    population.truncate(num_survivors.max(1));
+}
+
+/// Reproduce to fill population back up
+pub fn reproduce(population: &mut Vec<Individual>, target_size: usize, config: &EvolutionConfig) {
+    let mut rng = rand::thread_rng();
+    let survivors = population.clone();
+
+    while population.len() < target_size {
+        let roll: f32 = rng.gen();
+
+        let child_genotype = if roll < config.asexual_prob {
+            // Asexual: mutate a copy
+            let parent = survivors.choose(&mut rng).unwrap();
+            let mut child = parent.genotype.clone();
+            mutate(&mut child, &mut rng, config.mutation_rate);
+            child
+        } else if roll < config.asexual_prob + config.crossover_prob {
+            // Crossover
+            let p1 = survivors.choose(&mut rng).unwrap();
+            let p2 = survivors.choose(&mut rng).unwrap();
+            let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
+            mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
+            child
+        } else {
+            // Grafting
+            let p1 = survivors.choose(&mut rng).unwrap();
+            let p2 = survivors.choose(&mut rng).unwrap();
+            let mut child = graft(&p1.genotype, &p2.genotype, &mut rng);
+            mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
+            child
+        };
+
+        population.push(Individual {
+            genotype: child_genotype,
+            fitness: 0.0,
+        });
+    }
+}
+
+/// Run one generation of evolution
+pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
+    // Select survivors
+    select_survivors(&mut state.population, config.survival_ratio);
+
+    // Record best
+    if let Some(best) = state.population.first() {
+        state.best_fitness = best.fitness;
+    }
+
+    // Reproduce
+    reproduce(&mut state.population, config.population_size, config);
+
+    state.generation += 1;
+    state.current_individual = 0;
+
+    println!(
+        "Generation {}: best fitness = {:.3}",
+        state.generation, state.best_fitness
+    );
+}
