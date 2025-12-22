@@ -57,11 +57,11 @@ fn setup(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Ground plane - make it longer for walking tests
+    // Ground plane - infinite for all practical purposes
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(100.0, 20.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(10000.0, 10000.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
-        Collider::cuboid(50.0, 0.01, 10.0),
+        Collider::halfspace(Vec3::Y).unwrap(),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
