@@ -918,7 +918,7 @@ fn create_joint_headless(
         }
     };
 
-    // Apply joint limits
+    // Apply joint limits - let the brain control motors
     for (dof_idx, &(min, max)) in child_node.joint_limits.limits.iter().enumerate() {
         let axis = match dof_idx {
             0 => JointAxis::AngX,
@@ -926,8 +926,6 @@ fn create_joint_headless(
             _ => JointAxis::AngZ,
         };
         joint.set_limits(axis, [min, max]);
-        let stiffness = child_node.joint_limits.stiffness;
-        joint.set_motor(axis, 0.0, 0.0, 0.0, stiffness);
     }
 
     joint
