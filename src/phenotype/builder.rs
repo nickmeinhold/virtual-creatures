@@ -399,11 +399,7 @@ impl PhenotypeBuilder {
                 _ => JointAxis::AngZ,
             };
             joint.set_limits(axis, [min, max]);
-
-            // Apply stiffness as motor damping when approaching limits
-            // Higher stiffness means stronger resistance at limits
-            let stiffness = child_node.joint_limits.stiffness;
-            joint.set_motor(axis, 0.0, 0.0, 0.0, stiffness);
+            // Don't set motor here - let the brain control it
         }
 
         joint
