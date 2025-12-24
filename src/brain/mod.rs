@@ -12,6 +12,53 @@ use std::collections::HashMap;
 use crate::genotype::*;
 use crate::phenotype::{CreatureBody, CreaturePart};
 
+/// Safely get direction vectors from a transform, returning defaults if NaN
+struct SafeTransform {
+    translation: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+}
+
+impl SafeTransform {
+    fn from_global(transform: &GlobalTransform) -> Self {
+        let translation = transform.translation();
+
+        // Check for NaN in translation - if so, return safe defaults
+        if translation.is_nan() {
+            return Self {
+                translation: Vec3::ZERO,
+                right: Vec3::X,
+                up: Vec3::Y,
+                forward: Vec3::NEG_Z,
+            };
+        }
+
+        // Try to get rotation, use identity if invalid
+        let rotation = transform.rotation();
+        if rotation.is_nan() {
+            return Self {
+                translation,
+                right: Vec3::X,
+                up: Vec3::Y,
+                forward: Vec3::NEG_Z,
+            };
+        }
+
+        // Compute direction vectors manually to avoid panic on denormalized quaternions
+        let right = rotation * Vec3::X;
+        let up = rotation * Vec3::Y;
+        let forward = rotation * Vec3::NEG_Z;
+
+        Self {
+            translation,
+            right: if right.is_nan() { Vec3::X } else { right },
+            up: if up.is_nan() { Vec3::Y } else { up },
+            forward: if forward.is_nan() { Vec3::NEG_Z } else { forward },
+        }
+    }
+}
+
 /// Plugin for brain simulation
 pub struct BrainPlugin;
 
@@ -56,6 +103,11 @@ impl Brain {
     }
 }
 
+/// Sanitize a float value, replacing NaN/Inf with 0
+fn sanitize(v: f32) -> f32 {
+    if v.is_nan() || v.is_infinite() { 0.0 } else { v }
+}
+
 /// Evaluate a single neuron function
 fn evaluate_neuron(
     func: NeuronFunc,
@@ -64,7 +116,15 @@ fn evaluate_neuron(
     time: f32,
     dt: f32,
 ) -> f32 {
-    match func {
+    // Sanitize state if it became NaN
+    if state.is_nan() || state.is_infinite() {
+        *state = 0.0;
+    }
+
+    // Sanitize inputs
+    let inputs: Vec<f32> = inputs.iter().map(|&x| sanitize(x)).collect();
+
+    let result = match func {
         NeuronFunc::Sum => inputs.iter().sum(),
         NeuronFunc::Product => inputs.iter().product(),
         NeuronFunc::Divide => {
@@ -156,7 +216,10 @@ fn evaluate_neuron(
             let phase = (time * freq) % 1.0;
             phase * 2.0 - 1.0
         }
-    }
+    };
+
+    // Final sanitization of result
+    sanitize(result)
 }
 
 /// Tracks parent-child relationships for neural connections
@@ -279,11 +342,17 @@ fn run_brains(
                                 let motor = joint.data.as_ref().motor(axis);
                                 motor.map(|m| m.target_vel).unwrap_or_else(|| {
                                     // Fallback: use orientation component
-                                    let euler = transform.rotation().to_euler(EulerRot::XYZ);
-                                    match dof {
-                                        0 => euler.0,
-                                        1 => euler.1,
-                                        _ => euler.2,
+                                    let rotation = transform.rotation();
+                                    if rotation.is_nan() {
+                                        0.0
+                                    } else {
+                                        let euler = rotation.to_euler(EulerRot::XYZ);
+                                        let angle = match dof {
+                                            0 => euler.0,
+                                            1 => euler.1,
+                                            _ => euler.2,
+                                        };
+                                        if angle.is_nan() { 0.0 } else { angle }
                                     }
                                 })
                             } else {
@@ -294,18 +363,18 @@ fn run_brains(
                             // Contact sensing based on face direction
                             // Use simplified ground contact detection
                             if let Ok((_, _, transform)) = parts_query.get(part_entity) {
-                                let pos = transform.translation();
+                                let safe = SafeTransform::from_global(transform);
                                 // Check if face is pointing downward and close to ground
                                 let face_normal = match face {
-                                    Face::PosX => transform.right(),
-                                    Face::NegX => -transform.right(),
-                                    Face::PosY => transform.up(),
-                                    Face::NegY => -transform.up(),
-                                    Face::PosZ => transform.forward(),
-                                    Face::NegZ => -transform.forward(),
+                                    Face::PosX => safe.right,
+                                    Face::NegX => -safe.right,
+                                    Face::PosY => safe.up,
+                                    Face::NegY => -safe.up,
+                                    Face::PosZ => safe.forward,
+                                    Face::NegZ => -safe.forward,
                                 };
                                 // Activate if face is pointing down and part is near ground
-                                if face_normal.y < -0.5 && pos.y < 0.5 {
+                                if face_normal.y < -0.5 && safe.translation.y < 0.5 {
                                     1.0
                                 } else {
                                     0.0
@@ -318,11 +387,11 @@ fn run_brains(
                             // Simplified photosensor: detect light direction
                             // Returns how much the specified axis points toward light (up)
                             if let Ok((_, _, transform)) = parts_query.get(part_entity) {
-                                let up = transform.up();
+                                let safe = SafeTransform::from_global(transform);
                                 match axis {
-                                    SensorAxis::X => up.x,
-                                    SensorAxis::Y => up.y,
-                                    SensorAxis::Z => up.z,
+                                    SensorAxis::X => safe.up.x,
+                                    SensorAxis::Y => safe.up.y,
+                                    SensorAxis::Z => safe.up.z,
                                 }
                             } else {
                                 0.0
@@ -435,10 +504,12 @@ fn run_brains(
                         };
 
                         // Set motor velocity based on effector output
-                        let motor_velocity = value * 5.0; // Scale factor
+                        // Sanitize and clamp to prevent physics instability
+                        let motor_velocity = sanitize(value * 5.0).clamp(-50.0, 50.0);
+                        let max_force = sanitize(effector.max_force).clamp(0.0, 1000.0);
                         let raw = joint.data.as_mut();
                         raw.set_motor_velocity(axis, motor_velocity, 0.8);
-                        raw.set_motor_max_force(axis, effector.max_force);
+                        raw.set_motor_max_force(axis, max_force);
                     }
                 }
             }
