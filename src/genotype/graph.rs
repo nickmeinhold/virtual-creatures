@@ -2,14 +2,15 @@
 //!
 //! This avoids Rc<RefCell<>> complexity and is idiomatic Rust.
 
+use serde::{Deserialize, Serialize};
 use std::ops::{Index, IndexMut};
 
 /// Type-safe index into the node arena
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub usize);
 
 /// A connection between two nodes
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection<C> {
     pub from: NodeId,
     pub to: NodeId,
@@ -17,7 +18,7 @@ pub struct Connection<C> {
 }
 
 /// A directed graph with nodes of type N and connection data of type C
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectedGraph<N, C> {
     nodes: Vec<N>,
     connections: Vec<Connection<C>>,

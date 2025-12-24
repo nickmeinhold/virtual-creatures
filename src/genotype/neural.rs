@@ -4,8 +4,10 @@
 //! Each body part has its own local neural graph that gets instantiated
 //! when the phenotype is built.
 
+use serde::{Deserialize, Serialize};
+
 /// Sensor types that provide input signals
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SensorType {
     /// Current angle of a joint degree of freedom
     JointAngle { dof: usize },
@@ -16,7 +18,7 @@ pub enum SensorType {
 }
 
 /// Which face of a box-shaped part
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Face {
     PosX,
     NegX,
@@ -27,7 +29,7 @@ pub enum Face {
 }
 
 /// Axis for photosensors (renamed to avoid bevy conflict)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SensorAxis {
     X,
     Y,
@@ -35,7 +37,7 @@ pub enum SensorAxis {
 }
 
 /// Neuron function types from Karl Sims' paper
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NeuronFunc {
     // Basic arithmetic
     Sum,
@@ -111,7 +113,7 @@ impl NeuronFunc {
 }
 
 /// Input source for a neuron
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NeuralInput {
     /// Constant value
     Constant(f32),
@@ -128,21 +130,21 @@ pub enum NeuralInput {
 }
 
 /// A weighted input connection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightedInput {
     pub source: NeuralInput,
     pub weight: f32,
 }
 
 /// A neuron that processes inputs to produce an output
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Neuron {
     pub func: NeuronFunc,
     pub inputs: Vec<WeightedInput>,
 }
 
 /// An effector that applies force to a joint DOF
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Effector {
     /// Which degree of freedom of this part's joint
     pub dof: usize,
@@ -153,7 +155,7 @@ pub struct Effector {
 }
 
 /// Neural graph for a single body part
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeuralGraph {
     pub sensors: Vec<SensorType>,
     pub neurons: Vec<Neuron>,
@@ -193,7 +195,7 @@ impl Default for NeuralGraph {
 }
 
 /// Centralized neurons not associated with any body part
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CentralNervousSystem {
     pub neurons: Vec<Neuron>,
 }

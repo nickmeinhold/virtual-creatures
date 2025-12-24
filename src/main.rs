@@ -20,6 +20,8 @@ struct SimulationOptions {
     speed: f32,
     /// Verbose output
     verbose: bool,
+    /// Replay mode: load and watch saved creatures
+    replay: Option<String>,
 }
 
 impl Default for SimulationOptions {
@@ -28,6 +30,7 @@ impl Default for SimulationOptions {
             headless: false,
             speed: 1.0,
             verbose: true,
+            replay: None,
         }
     }
 }
@@ -39,7 +42,7 @@ fn parse_args() -> SimulationOptions {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--headless" | "-h" => opts.headless = true,
+            "--headless" => opts.headless = true,
             "--speed" | "-s" => {
                 i += 1;
                 if i < args.len() {
@@ -47,16 +50,28 @@ fn parse_args() -> SimulationOptions {
                 }
             }
             "--quiet" | "-q" => opts.verbose = false,
-            "--help" => {
+            "--replay" | "-r" => {
+                i += 1;
+                if i < args.len() {
+                    opts.replay = Some(args[i].clone());
+                } else {
+                    opts.replay = Some("creatures.json".to_string());
+                }
+            }
+            "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
                 println!("Options:");
-                println!("  --headless, -h    Run without graphics (faster)");
+                println!("  --headless        Run without graphics (faster evolution)");
                 println!("  --speed, -s N     Simulation speed multiplier (default: 1.0)");
-                println!("                    Use higher values for faster evolution");
-                println!("                    e.g., --speed 10 for 10x faster");
                 println!("  --quiet, -q       Reduce output verbosity");
-                println!("  --help            Show this help message");
+                println!("  --replay, -r FILE Load and watch saved creatures (default: creatures.json)");
+                println!("  --help, -h        Show this help message");
+                println!();
+                println!("Examples:");
+                println!("  cargo run                          # Run with graphics");
+                println!("  cargo run -- --headless --speed 10 # Fast evolution");
+                println!("  cargo run -- --replay              # Watch saved creatures");
                 std::process::exit(0);
             }
             _ => {}
@@ -70,7 +85,9 @@ fn parse_args() -> SimulationOptions {
 fn main() {
     let opts = parse_args();
 
-    if opts.headless {
+    if let Some(ref path) = opts.replay {
+        run_replay(opts.clone(), path.clone());
+    } else if opts.headless {
         run_headless(opts);
     } else {
         run_with_graphics(opts);
@@ -124,6 +141,174 @@ fn run_headless(opts: SimulationOptions) {
 /// Resource to track simulation speed
 #[derive(Resource)]
 struct SimulationSpeed(f32);
+
+/// State for replay mode
+#[derive(Resource)]
+struct ReplayState {
+    archive: genotype::CreatureArchive,
+    current_index: usize,
+    creature_spawned: bool,
+    display_time: f32,
+}
+
+fn run_replay(opts: SimulationOptions, path: String) {
+    // Load the archive
+    let archive = match genotype::CreatureArchive::load(&path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error loading creatures from '{}': {}", path, e);
+            eprintln!("Run evolution first to generate creatures.");
+            std::process::exit(1);
+        }
+    };
+
+    if archive.creatures.is_empty() {
+        eprintln!("No creatures found in '{}'", path);
+        std::process::exit(1);
+    }
+
+    println!("Loaded {} creatures from '{}'", archive.creatures.len(), path);
+    println!("Press SPACE to cycle through creatures\n");
+
+    let replay_state = ReplayState {
+        archive,
+        current_index: 0,
+        creature_spawned: false,
+        display_time: 0.0,
+    };
+
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
+        .add_plugins(RapierDebugRenderPlugin::default())
+        .add_plugins(BrainPlugin)
+        .insert_resource(opts)
+        .insert_resource(replay_state)
+        .add_systems(Startup, setup_replay)
+        .add_systems(Update, (replay_system, camera_follow_replay))
+        .run();
+}
+
+fn setup_replay(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Camera
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(5.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // Light
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 10000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // Ground plane
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(10000.0, 10000.0))),
+        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
+        Collider::halfspace(Vec3::Y).unwrap(),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
+
+    // Tracker resource
+    commands.insert_resource(CreatureTracker::default());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    time: Res<Time>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<ReplayState>,
+    mut tracker: ResMut<CreatureTracker>,
+    creatures: Query<Entity, With<TestCreature>>,
+    creature_parts: Query<(&CreaturePart, &Transform)>,
+) {
+    // Check for space to cycle creatures
+    if keyboard.just_pressed(KeyCode::Space) {
+        // Despawn current creature
+        for entity in creatures.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+        state.current_index = (state.current_index + 1) % state.archive.creatures.len();
+        state.creature_spawned = false;
+        state.display_time = 0.0;
+    }
+
+    // Spawn creature if needed
+    if !state.creature_spawned && state.current_index < state.archive.creatures.len() {
+        // Clone data to avoid borrow issues
+        let saved = state.archive.creatures[state.current_index].clone();
+        let current_index = state.current_index;
+        let total_creatures = state.archive.creatures.len();
+        let spawn_pos = Vec3::new(0.0, 2.0, 0.0);
+
+        let spawned = PhenotypeBuilder::spawn(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &saved.genotype,
+            spawn_pos,
+        );
+
+        // Mark as test creature
+        for entity in &spawned.parts {
+            commands.entity(*entity).insert(TestCreature);
+        }
+        commands.entity(spawned.root).insert(TestCreature);
+
+        // Add brain
+        commands.entity(spawned.creature_entity).insert(Brain::new(saved.genotype.clone()));
+
+        tracker.center = spawn_pos;
+        state.creature_spawned = true;
+
+        println!(
+            "Creature {}/{}: fitness={:.3}, gen={}, parts={}",
+            current_index + 1,
+            total_creatures,
+            saved.fitness,
+            saved.generation,
+            saved.part_count,
+        );
+    }
+
+    // Update display time and tracker
+    state.display_time += time.delta_secs();
+
+    let mut total_pos = Vec3::ZERO;
+    let mut count = 0;
+    for (_, transform) in creature_parts.iter() {
+        total_pos += transform.translation;
+        count += 1;
+    }
+    if count > 0 {
+        tracker.center = total_pos / count as f32;
+    }
+}
+
+fn camera_follow_replay(
+    tracker: Res<CreatureTracker>,
+    mut camera: Query<&mut Transform, With<Camera3d>>,
+) {
+    if let Ok(mut cam_transform) = camera.get_single_mut() {
+        let target = tracker.center;
+        let offset = Vec3::new(8.0, 6.0, 12.0);
+        let desired = target + offset;
+        cam_transform.translation = cam_transform.translation.lerp(desired, 0.02);
+        cam_transform.look_at(target, Vec3::Y);
+    }
+}
 
 /// Marker for the current test creature
 #[derive(Component)]

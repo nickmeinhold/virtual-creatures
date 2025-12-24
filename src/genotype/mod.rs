@@ -6,9 +6,11 @@
 //! - Graphs can be recursive/cyclic for fractal-like structures
 
 mod graph;
+mod io;
 mod morphology;
 mod neural;
 
 pub use graph::*;
+pub use io::*;
 pub use morphology::*;
 pub use neural::*;

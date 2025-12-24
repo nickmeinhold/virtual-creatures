@@ -61,6 +61,10 @@ pub struct EvolutionState {
     pub current_individual: usize,
     pub test_start_time: f32,
     pub test_start_position: Vec3,
+    /// Archive of best creatures (optional)
+    pub archive: Option<CreatureArchive>,
+    /// Path to save archive (if set, saves after each generation)
+    pub save_path: Option<String>,
 }
 
 impl Default for EvolutionState {
@@ -72,6 +76,8 @@ impl Default for EvolutionState {
             current_individual: 0,
             test_start_time: 0.0,
             test_start_position: Vec3::ZERO,
+            archive: Some(CreatureArchive::new()),
+            save_path: Some("creatures.json".to_string()),
         }
     }
 }
@@ -663,9 +669,33 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
     // Select survivors
     select_survivors(&mut state.population, config.survival_ratio);
 
-    // Record best
+    // Record best and save to archive
     if let Some(best) = state.population.first() {
         state.best_fitness = best.fitness;
+
+        // Add to archive if enabled
+        if let Some(ref mut archive) = state.archive {
+            // Count parts in the best creature
+            let part_count = count_spawned_parts(&best.genotype);
+
+            let saved = SavedCreature::new(
+                best.genotype.clone(),
+                best.fitness,
+                state.generation,
+                part_count,
+            );
+            archive.add(saved);
+
+            // Keep only the best 10
+            archive.keep_best(10);
+
+            // Save to file if path is set
+            if let Some(ref path) = state.save_path {
+                if let Err(e) = archive.save(path) {
+                    eprintln!("Warning: Failed to save creatures: {}", e);
+                }
+            }
+        }
     }
 
     // Reproduce
@@ -678,4 +708,45 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
         "Generation {}: best fitness = {:.3}",
         state.generation, state.best_fitness
     );
+}
+
+/// Count how many parts would be spawned from a genotype
+fn count_spawned_parts(genotype: &CreatureGenotype) -> usize {
+    use std::collections::HashMap;
+
+    fn count_recursive(
+        genotype: &CreatureGenotype,
+        node_id: NodeId,
+        instances: &mut HashMap<NodeId, usize>,
+        depth: usize,
+    ) -> usize {
+        if depth >= 10 {
+            return 0;
+        }
+
+        let mut count = 1; // This node
+
+        for conn in genotype.morphology.connections_from(node_id) {
+            let child_node = &genotype.morphology[conn.to];
+            let instance_count = instances.get(&conn.to).copied().unwrap_or(0);
+
+            if instance_count >= child_node.recursive_limit as usize {
+                continue;
+            }
+
+            let at_terminal = instance_count + 1 >= child_node.recursive_limit as usize;
+            if conn.data.terminal_only && !at_terminal {
+                continue;
+            }
+
+            *instances.entry(conn.to).or_insert(0) += 1;
+            count += count_recursive(genotype, conn.to, instances, depth + 1);
+        }
+
+        count
+    }
+
+    let mut instances = HashMap::new();
+    instances.insert(genotype.root, 1);
+    count_recursive(genotype, genotype.root, &mut instances, 0)
 }

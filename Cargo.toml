@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.15"
+bevy = { version = "0.15", features = ["serialize"] }
 bevy_rapier3d = "0.28"
 rand = "0.8"
 nalgebra = "0.33"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # Enable optimizations for dependencies in dev builds (faster physics)
 [profile.dev.package."*"]

@@ -6,12 +6,13 @@
 //! - The graph can be recursive for fractal-like structures
 
 use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use super::graph::{DirectedGraph, NodeId};
 use super::neural::{CentralNervousSystem, NeuralGraph};
 
 /// Joint types from Karl Sims' paper
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JointType {
     /// No movement allowed
     Rigid,
@@ -42,7 +43,7 @@ impl JointType {
 }
 
 /// Joint limits for each degree of freedom
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JointLimits {
     /// (min, max) angle in radians for each DOF
     pub limits: Vec<(f32, f32)>,
@@ -60,7 +61,7 @@ impl JointLimits {
 }
 
 /// A body part node in the morphology graph
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MorphologyNode {
     /// Dimensions of the box-shaped part
     pub dimensions: Vec3,
@@ -101,7 +102,7 @@ impl MorphologyNode {
 }
 
 /// How a child part attaches to its parent
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MorphologyConnection {
     /// Position on parent's surface where child attaches
     /// Normalized to [-1, 1] for each axis, clamped to surface
@@ -155,7 +156,7 @@ impl Default for MorphologyConnection {
 }
 
 /// Axis for reflection
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReflectAxis {
     X,
     Y,
@@ -163,7 +164,7 @@ pub enum ReflectAxis {
 }
 
 /// Complete genotype for a creature
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatureGenotype {
     /// The morphology graph
     pub morphology: DirectedGraph<MorphologyNode, MorphologyConnection>,
