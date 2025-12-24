@@ -277,7 +277,7 @@ impl PhenotypeBuilder {
     fn compute_child_transform(
         parent_transform: &Transform,
         parent_node: &MorphologyNode,
-        child_node: &MorphologyNode,
+        _child_node: &MorphologyNode,
         connection: &MorphologyConnection,
         reflection: Vec3,
     ) -> Transform {

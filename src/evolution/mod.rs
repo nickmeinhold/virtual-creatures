@@ -177,43 +177,39 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
             let output_idx = if !node.neural.sensors.is_empty() && rng.gen_bool(0.5) {
                 // Add a neuron that modulates based on sensor
                 let sensor_idx = rng.gen_range(0..node.neural.sensors.len());
-                // Use the full range of neuron functions
-                let proc_func = match rng.gen_range(0..21) {
+                // Use the available neuron functions (17 total)
+                let proc_func = match rng.gen_range(0..17) {
                     0 => NeuronFunc::Sum,
                     1 => NeuronFunc::Product,
-                    2 => NeuronFunc::Divide,
-                    3 => NeuronFunc::SumThreshold,
-                    4 => NeuronFunc::GreaterThan,
-                    5 => NeuronFunc::SignOf,
-                    6 => NeuronFunc::Min,
-                    7 => NeuronFunc::Max,
-                    8 => NeuronFunc::Abs,
-                    9 => NeuronFunc::If,
-                    10 => NeuronFunc::Interpolate,
-                    11 => NeuronFunc::Sin,
-                    12 => NeuronFunc::Cos,
-                    13 => NeuronFunc::Atan,
-                    14 => NeuronFunc::Log,
-                    15 => NeuronFunc::Exp,
-                    16 => NeuronFunc::Sigmoid,
-                    17 => NeuronFunc::Integrate,
-                    18 => NeuronFunc::Differentiate,
-                    19 => NeuronFunc::Smooth,
-                    _ => NeuronFunc::Memory,
+                    2 => NeuronFunc::SumThreshold,
+                    3 => NeuronFunc::GreaterThan,
+                    4 => NeuronFunc::SignOf,
+                    5 => NeuronFunc::Min,
+                    6 => NeuronFunc::Max,
+                    7 => NeuronFunc::Abs,
+                    8 => NeuronFunc::If,
+                    9 => NeuronFunc::Interpolate,
+                    10 => NeuronFunc::Sin,
+                    11 => NeuronFunc::Cos,
+                    12 => NeuronFunc::Sigmoid,
+                    13 => NeuronFunc::Integrate,
+                    14 => NeuronFunc::Smooth,
+                    15 => NeuronFunc::OscillateWave,
+                    _ => NeuronFunc::OscillateSaw,
                 };
 
                 // Build appropriate inputs based on function arity
                 let inputs = match proc_func.num_inputs() {
                     1 => vec![
-                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::Neuron { part: PartRef::Local, index: osc_idx }, weight: 1.0 },
                     ],
                     3 => vec![
                         WeightedInput { source: NeuralInput::Sensor(sensor_idx), weight: 1.0 },
                         WeightedInput { source: NeuralInput::Constant(-1.0), weight: 1.0 },
-                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::Neuron { part: PartRef::Local, index: osc_idx }, weight: 1.0 },
                     ],
                     _ => vec![
-                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::Neuron { part: PartRef::Local, index: osc_idx }, weight: 1.0 },
                         WeightedInput { source: NeuralInput::Sensor(sensor_idx), weight: rng.gen_range(0.1..1.0) },
                     ],
                 };
@@ -230,39 +226,13 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
                 let effector = Effector {
                     dof: d,
                     input: WeightedInput {
-                        source: NeuralInput::LocalNeuron(output_idx),
+                        source: NeuralInput::Neuron { part: PartRef::Local, index: output_idx },
                         weight: rng.gen_range(1.0..5.0),
                     },
                     max_force: rng.gen_range(50.0..200.0) * force_scale,
                 };
                 node.neural.add_effector(effector);
             }
-        }
-    }
-
-    // Add central nervous system neurons for global coordination
-    let num_parts = genotype.part_type_count();
-    if num_parts > 1 && rng.gen_bool(0.5) {
-        // Add a central oscillator that parts can reference
-        let central_osc = Neuron {
-            func: NeuronFunc::OscillateWave,
-            inputs: vec![WeightedInput {
-                source: NeuralInput::Constant(rng.gen_range(0.3..1.5)),
-                weight: 1.0,
-            }],
-        };
-        genotype.central_nervous_system.neurons.push(central_osc);
-
-        // Maybe add a processing neuron that combines inputs
-        if rng.gen_bool(0.3) {
-            let proc_neuron = Neuron {
-                func: NeuronFunc::Smooth,
-                inputs: vec![WeightedInput {
-                    source: NeuralInput::CentralNeuron(0),
-                    weight: 1.0,
-                }],
-            };
-            genotype.central_nervous_system.neurons.push(proc_neuron);
         }
     }
 
@@ -275,11 +245,11 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
                 func: NeuronFunc::Sum,
                 inputs: vec![
                     WeightedInput {
-                        source: NeuralInput::ParentNeuron(0),
+                        source: NeuralInput::Neuron { part: PartRef::Parent, index: 0 },
                         weight: rng.gen_range(0.5..1.5),
                     },
                     WeightedInput {
-                        source: NeuralInput::LocalNeuron(0),
+                        source: NeuralInput::Neuron { part: PartRef::Local, index: 0 },
                         weight: rng.gen_range(0.5..1.5),
                     },
                 ],
@@ -293,34 +263,16 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
                 func: NeuronFunc::Sum,
                 inputs: vec![
                     WeightedInput {
-                        source: NeuralInput::ChildNeuron { connection: 0, neuron: 0 },
+                        source: NeuralInput::Neuron { part: PartRef::Child(0), index: 0 },
                         weight: rng.gen_range(0.3..1.0),
                     },
                     WeightedInput {
-                        source: NeuralInput::LocalNeuron(0),
+                        source: NeuralInput::Neuron { part: PartRef::Local, index: 0 },
                         weight: 1.0,
                     },
                 ],
             };
             node.neural.add_neuron(child_input_neuron);
-        }
-
-        // Maybe reference central nervous system
-        if !genotype.central_nervous_system.neurons.is_empty() && rng.gen_bool(0.4) {
-            let cns_input_neuron = Neuron {
-                func: NeuronFunc::Product,
-                inputs: vec![
-                    WeightedInput {
-                        source: NeuralInput::CentralNeuron(0),
-                        weight: 1.0,
-                    },
-                    WeightedInput {
-                        source: NeuralInput::LocalNeuron(0),
-                        weight: 1.0,
-                    },
-                ],
-            };
-            node.neural.add_neuron(cns_input_neuron);
         }
     }
 

@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::graph::{DirectedGraph, NodeId};
-use super::neural::{CentralNervousSystem, NeuralGraph};
+use super::neural::NeuralGraph;
 
 /// Joint types from Karl Sims' paper
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,8 +170,6 @@ pub struct CreatureGenotype {
     pub morphology: DirectedGraph<MorphologyNode, MorphologyConnection>,
     /// The root node of the morphology
     pub root: NodeId,
-    /// Centralized neurons not associated with any part
-    pub central_nervous_system: CentralNervousSystem,
 }
 
 impl CreatureGenotype {
@@ -179,11 +177,7 @@ impl CreatureGenotype {
     pub fn new(root_node: MorphologyNode) -> Self {
         let mut morphology = DirectedGraph::new();
         let root = morphology.add_node(root_node);
-        Self {
-            morphology,
-            root,
-            central_nervous_system: CentralNervousSystem::new(),
-        }
+        Self { morphology, root }
     }
 
     /// Add a part connected to an existing part
@@ -201,10 +195,5 @@ impl CreatureGenotype {
     /// Get the root node
     pub fn root_node(&self) -> &MorphologyNode {
         &self.morphology[self.root]
-    }
-
-    /// Number of part types (nodes in genotype, not instantiated parts)
-    pub fn part_type_count(&self) -> usize {
-        self.morphology.node_count()
     }
 }

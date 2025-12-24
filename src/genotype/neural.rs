@@ -36,13 +36,12 @@ pub enum SensorAxis {
     Z,
 }
 
-/// Neuron function types from Karl Sims' paper
+/// Neuron function types (simplified from Karl Sims' original 23)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NeuronFunc {
     // Basic arithmetic
     Sum,
     Product,
-    Divide,
 
     // Comparison
     SumThreshold,
@@ -59,18 +58,13 @@ pub enum NeuronFunc {
     // Trigonometric
     Sin,
     Cos,
-    Atan,
 
-    // Mathematical
-    Log,
-    Exp,
+    // Activation
     Sigmoid,
 
     // Temporal (stateful)
     Integrate,
-    Differentiate,
     Smooth,
-    Memory,
 
     // Oscillators (stateful)
     OscillateWave,
@@ -86,21 +80,15 @@ impl NeuronFunc {
             | NeuronFunc::Abs
             | NeuronFunc::Sin
             | NeuronFunc::Cos
-            | NeuronFunc::Atan
-            | NeuronFunc::Log
-            | NeuronFunc::Exp
             | NeuronFunc::Sigmoid
             | NeuronFunc::Integrate
-            | NeuronFunc::Differentiate
             | NeuronFunc::Smooth
-            | NeuronFunc::Memory
             | NeuronFunc::OscillateWave
             | NeuronFunc::OscillateSaw => 1,
 
             // Binary functions
             NeuronFunc::Sum
             | NeuronFunc::Product
-            | NeuronFunc::Divide
             | NeuronFunc::SumThreshold
             | NeuronFunc::GreaterThan
             | NeuronFunc::Min
@@ -112,6 +100,17 @@ impl NeuronFunc {
     }
 }
 
+/// Reference to which body part a neuron belongs to
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PartRef {
+    /// This body part
+    Local,
+    /// The parent body part
+    Parent,
+    /// A child body part (by connection index)
+    Child(usize),
+}
+
 /// Input source for a neuron
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NeuralInput {
@@ -119,14 +118,8 @@ pub enum NeuralInput {
     Constant(f32),
     /// From a sensor in the same part
     Sensor(usize),
-    /// From another neuron in the same part
-    LocalNeuron(usize),
-    /// From a neuron in the parent part
-    ParentNeuron(usize),
-    /// From a neuron in a child part (by connection index)
-    ChildNeuron { connection: usize, neuron: usize },
-    /// From a centralized (unassociated) neuron
-    CentralNeuron(usize),
+    /// From a neuron (in this part, parent, or child)
+    Neuron { part: PartRef, index: usize },
 }
 
 /// A weighted input connection
@@ -194,22 +187,3 @@ impl Default for NeuralGraph {
     }
 }
 
-/// Centralized neurons not associated with any body part
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CentralNervousSystem {
-    pub neurons: Vec<Neuron>,
-}
-
-impl CentralNervousSystem {
-    pub fn new() -> Self {
-        Self {
-            neurons: Vec::new(),
-        }
-    }
-}
-
-impl Default for CentralNervousSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}

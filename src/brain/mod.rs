@@ -79,25 +79,17 @@ pub struct Brain {
     pub neuron_state: HashMap<(usize, usize, usize), f32>,
     /// Simulation time for oscillators
     pub time: f32,
-    /// Central neuron outputs
-    pub central_outputs: Vec<f32>,
-    /// Central neuron state (keyed by neuron_idx)
-    pub central_state: HashMap<usize, f32>,
     /// Sensor values per part (keyed by (node_id, instance), then sensor index)
     pub sensor_values: HashMap<(usize, usize), Vec<f32>>,
 }
 
 impl Brain {
     pub fn new(genotype: CreatureGenotype) -> Self {
-        // Initialize central outputs
-        let central_count = genotype.central_nervous_system.neurons.len();
         Self {
             genotype,
             neuron_outputs: HashMap::new(),
             neuron_state: HashMap::new(),
             time: 0.0,
-            central_outputs: vec![0.0; central_count],
-            central_state: HashMap::new(),
             sensor_values: HashMap::new(),
         }
     }
@@ -127,13 +119,6 @@ fn evaluate_neuron(
     let result = match func {
         NeuronFunc::Sum => inputs.iter().sum(),
         NeuronFunc::Product => inputs.iter().product(),
-        NeuronFunc::Divide => {
-            if inputs.len() >= 2 && inputs[1].abs() > 0.001 {
-                inputs[0] / inputs[1]
-            } else {
-                0.0
-            }
-        }
         NeuronFunc::SumThreshold => {
             let sum: f32 = inputs.iter().sum();
             if sum > 0.0 { 1.0 } else { -1.0 }
@@ -176,9 +161,6 @@ fn evaluate_neuron(
         }
         NeuronFunc::Sin => inputs.first().map(|x| x.sin()).unwrap_or(0.0),
         NeuronFunc::Cos => inputs.first().map(|x| x.cos()).unwrap_or(0.0),
-        NeuronFunc::Atan => inputs.first().map(|x| x.atan()).unwrap_or(0.0),
-        NeuronFunc::Log => inputs.first().map(|x| x.abs().max(0.001).ln()).unwrap_or(0.0),
-        NeuronFunc::Exp => inputs.first().map(|x| x.clamp(-10.0, 10.0).exp()).unwrap_or(1.0),
         NeuronFunc::Sigmoid => {
             inputs.first().map(|x| 1.0 / (1.0 + (-x).exp())).unwrap_or(0.5)
         }
@@ -188,23 +170,10 @@ fn evaluate_neuron(
             *state = state.clamp(-10.0, 10.0);
             *state
         }
-        NeuronFunc::Differentiate => {
-            let input = inputs.first().copied().unwrap_or(0.0);
-            let diff = (input - *state) / dt.max(0.001);
-            *state = input;
-            diff.clamp(-10.0, 10.0)
-        }
         NeuronFunc::Smooth => {
             let input = inputs.first().copied().unwrap_or(0.0);
             let alpha = 0.1; // smoothing factor
             *state = *state * (1.0 - alpha) + input * alpha;
-            *state
-        }
-        NeuronFunc::Memory => {
-            let input = inputs.first().copied().unwrap_or(0.0);
-            if input.abs() > 0.5 {
-                *state = input;
-            }
             *state
         }
         NeuronFunc::OscillateWave => {
@@ -237,7 +206,6 @@ fn get_input_value(
     part_key: (usize, usize),
     sensor_values: &HashMap<(usize, usize), Vec<f32>>,
     neuron_outputs: &HashMap<(usize, usize), Vec<f32>>,
-    central_outputs: &[f32],
     relations: &PartRelations,
 ) -> f32 {
     let raw = match input {
@@ -248,37 +216,24 @@ fn get_input_value(
                 .copied()
                 .unwrap_or(0.0)
         }
-        NeuralInput::LocalNeuron(idx) => {
-            neuron_outputs.get(&part_key)
-                .and_then(|n| n.get(*idx))
+        NeuralInput::Neuron { part, index } => {
+            let target_key = match part {
+                PartRef::Local => Some(part_key),
+                PartRef::Parent => {
+                    relations.parent.get(&part_key.0)
+                        .map(|parent_node| (*parent_node, 0))
+                }
+                PartRef::Child(connection) => {
+                    relations.children.get(&part_key.0)
+                        .and_then(|children| children.get(*connection))
+                        .map(|child_node| (*child_node, 0))
+                }
+            };
+            target_key
+                .and_then(|key| neuron_outputs.get(&key))
+                .and_then(|n| n.get(*index))
                 .copied()
                 .unwrap_or(0.0)
-        }
-        NeuralInput::ParentNeuron(idx) => {
-            // Get parent node and look up its neuron output
-            relations.parent.get(&part_key.0)
-                .and_then(|parent_node| {
-                    // Use instance 0 for parent (simplified)
-                    neuron_outputs.get(&(*parent_node, 0))
-                })
-                .and_then(|n| n.get(*idx))
-                .copied()
-                .unwrap_or(0.0)
-        }
-        NeuralInput::ChildNeuron { connection, neuron } => {
-            // Get child at specified connection index
-            relations.children.get(&part_key.0)
-                .and_then(|children| children.get(*connection))
-                .and_then(|child_node| {
-                    // Use instance 0 for child (simplified)
-                    neuron_outputs.get(&(*child_node, 0))
-                })
-                .and_then(|n| n.get(*neuron))
-                .copied()
-                .unwrap_or(0.0)
-        }
-        NeuralInput::CentralNeuron(idx) => {
-            central_outputs.get(*idx).copied().unwrap_or(0.0)
         }
     };
     raw * weight
@@ -405,37 +360,6 @@ fn run_brains(
             }
         }
 
-        // Evaluate central nervous system first
-        // Clone the CNS neurons to avoid borrow issues
-        let cns_neurons: Vec<_> = brain.genotype.central_nervous_system.neurons.clone();
-        let mut new_central_outputs = vec![0.0; cns_neurons.len()];
-
-        for (neuron_idx, neuron) in cns_neurons.iter().enumerate() {
-            let mut inputs = Vec::new();
-            for weighted_input in &neuron.inputs {
-                let value = get_input_value(
-                    &weighted_input.source,
-                    weighted_input.weight,
-                    (0, 0), // Central neurons don't have a part
-                    &brain.sensor_values,
-                    &brain.neuron_outputs,
-                    &brain.central_outputs,
-                    &relations,
-                );
-                inputs.push(value);
-            }
-
-            let state = brain.central_state.entry(neuron_idx).or_insert(0.0);
-            new_central_outputs[neuron_idx] = evaluate_neuron(
-                neuron.func,
-                &inputs,
-                state,
-                brain_time,
-                dt,
-            );
-        }
-        brain.central_outputs = new_central_outputs;
-
         // Evaluate each part's neural network
         // First collect what we need to avoid borrow issues
         let part_neurons: Vec<_> = part_joints.keys()
@@ -459,7 +383,6 @@ fn run_brains(
                         part_key,
                         &brain.sensor_values,
                         &brain.neuron_outputs,
-                        &brain.central_outputs,
                         &relations,
                     );
                     inputs.push(value);
@@ -492,7 +415,6 @@ fn run_brains(
                             part_key,
                             &brain.sensor_values,
                             &brain.neuron_outputs,
-                            &brain.central_outputs,
                             &relations,
                         );
 
