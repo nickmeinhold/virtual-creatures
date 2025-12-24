@@ -457,17 +457,18 @@ pub struct EvolutionConfig {
 
 ```rust
 pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
-    let forward_dist = end_pos.x - start_pos.x;
+    // Horizontal distance in any direction (ignore Y to avoid rewarding falling)
     let horizontal_dist = Vec2::new(
         end_pos.x - start_pos.x,
         end_pos.z - start_pos.z
     ).length();
 
-    // 70% forward progress + 30% total distance
-    let fitness = forward_dist.max(0.0) * 0.7 + horizontal_dist * 0.3;
-    fitness / duration.max(1.0)
+    // Normalize by time to get speed
+    horizontal_dist / duration.max(1.0)
 }
 ```
+
+**Fitness metric:** Horizontal speed in any direction.
 
 ### Mutation
 
