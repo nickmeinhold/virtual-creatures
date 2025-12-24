@@ -177,6 +177,7 @@ impl PhenotypeBuilder {
             let child_transform = Self::compute_child_transform(
                 &parent.transform,
                 parent.node,
+                child_node,
                 &conn.data,
                 combined_reflection,
             );
@@ -236,6 +237,11 @@ impl PhenotypeBuilder {
             0.5 + 0.3 * (info.node_id.0 as f32 * 2.1).sin(),
         ));
 
+        // Collision groups: creature parts only collide with ground, not each other
+        // Group 1 = creature parts, Group 0 = ground/environment
+        let creature_group = Group::GROUP_1;
+        let ground_group = Group::GROUP_2;
+
         // Spawn the entity
         let mut entity_commands = commands.spawn((
             Mesh3d(mesh),
@@ -245,6 +251,8 @@ impl PhenotypeBuilder {
             Collider::cuboid(dims.x / 2.0, dims.y / 2.0, dims.z / 2.0),
             // Use volume-based mass (density 1.0 kg/m³)
             ColliderMassProperties::Mass(info.node.volume()),
+            // Collision groups: creature parts belong to GROUP_1, filter to collide only with GROUP_2 (ground)
+            CollisionGroups::new(creature_group, ground_group),
             CreaturePart {
                 creature_id: info.creature_id,
                 node_id: info.node_id,
@@ -269,6 +277,7 @@ impl PhenotypeBuilder {
     fn compute_child_transform(
         parent_transform: &Transform,
         parent_node: &MorphologyNode,
+        child_node: &MorphologyNode,
         connection: &MorphologyConnection,
         reflection: Vec3,
     ) -> Transform {
@@ -334,7 +343,7 @@ impl PhenotypeBuilder {
         // Anchor on parent surface
         let parent_anchor = Self::clamp_to_surface(connection.position, parent_half);
 
-        // Anchor on child - opposite face from connection direction
+        // Anchor on child (at origin since child center is at parent surface)
         let conn_dir = connection.position.normalize_or_zero();
         let child_anchor = -conn_dir * child_half;
 

@@ -65,6 +65,8 @@ pub struct EvolutionState {
     pub archive: Option<CreatureArchive>,
     /// Path to save archive (if set, saves after each generation)
     pub save_path: Option<String>,
+    /// Frames to wait before spawning first creature (let physics initialize)
+    pub frames_before_spawn: u32,
 }
 
 impl Default for EvolutionState {
@@ -78,6 +80,7 @@ impl Default for EvolutionState {
             test_start_position: Vec3::ZERO,
             archive: Some(CreatureArchive::new()),
             save_path: Some("creatures.json".to_string()),
+            frames_before_spawn: 2,
         }
     }
 }

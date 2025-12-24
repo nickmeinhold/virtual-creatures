@@ -103,6 +103,7 @@ fn run_with_graphics(opts: SimulationOptions) {
         .insert_resource(opts)
         .insert_resource(EvolutionConfig::default())
         .insert_resource(EvolutionState::default())
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0) })
         .add_systems(Startup, setup_with_graphics)
         .add_systems(Update, (evolution_system, camera_follow))
         .run();
@@ -149,6 +150,8 @@ struct ReplayState {
     current_index: usize,
     creature_spawned: bool,
     display_time: f32,
+    /// Frames to wait before spawning first creature (let physics initialize)
+    frames_before_spawn: u32,
 }
 
 fn run_replay(opts: SimulationOptions, path: String) {
@@ -175,6 +178,7 @@ fn run_replay(opts: SimulationOptions, path: String) {
         current_index: 0,
         creature_spawned: false,
         display_time: 0.0,
+        frames_before_spawn: 2,
     };
 
     App::new()
@@ -184,8 +188,9 @@ fn run_replay(opts: SimulationOptions, path: String) {
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
         .insert_resource(replay_state)
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0) })
         .add_systems(Startup, setup_replay)
-        .add_systems(Update, (replay_system, camera_follow_replay))
+        .add_systems(Update, (replay_system, camera_follow))
         .run();
 }
 
@@ -210,16 +215,14 @@ fn setup_replay(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Ground plane
+    // Ground plane - belongs to GROUP_2, collides with GROUP_1 (creature parts)
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(10000.0, 10000.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
         Collider::halfspace(Vec3::Y).unwrap(),
+        CollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
-
-    // Tracker resource
-    commands.insert_resource(CreatureTracker::default());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,6 +237,12 @@ fn replay_system(
     creatures: Query<Entity, With<TestCreature>>,
     creature_parts: Query<(&CreaturePart, &Transform)>,
 ) {
+    // Wait for physics to initialize
+    if state.frames_before_spawn > 0 {
+        state.frames_before_spawn -= 1;
+        return;
+    }
+
     // Check for space to cycle creatures
     if keyboard.just_pressed(KeyCode::Space) {
         // Despawn current creature
@@ -274,12 +283,14 @@ fn replay_system(
         state.creature_spawned = true;
 
         println!(
-            "Creature {}/{}: fitness={:.3}, gen={}, parts={}",
+            "Creature {}/{}: fitness={:.3}, gen={}, parts={}, spawned {} entities at {:?}",
             current_index + 1,
             total_creatures,
             saved.fitness,
             saved.generation,
             saved.part_count,
+            spawned.parts.len(),
+            spawn_pos,
         );
     }
 
@@ -293,20 +304,10 @@ fn replay_system(
         count += 1;
     }
     if count > 0 {
-        tracker.center = total_pos / count as f32;
-    }
-}
-
-fn camera_follow_replay(
-    tracker: Res<CreatureTracker>,
-    mut camera: Query<&mut Transform, With<Camera3d>>,
-) {
-    if let Ok(mut cam_transform) = camera.get_single_mut() {
-        let target = tracker.center;
-        let offset = Vec3::new(8.0, 6.0, 12.0);
-        let desired = target + offset;
-        cam_transform.translation = cam_transform.translation.lerp(desired, 0.02);
-        cam_transform.look_at(target, Vec3::Y);
+        let new_center = total_pos / count as f32;
+        if new_center.is_finite() {
+            tracker.center = new_center;
+        }
     }
 }
 
@@ -349,20 +350,18 @@ fn setup_with_graphics(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Ground plane with visual mesh
+    // Ground plane with visual mesh - belongs to GROUP_2, collides with GROUP_1 (creature parts)
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(10000.0, 10000.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
         Collider::halfspace(Vec3::Y).unwrap(),
+        CollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
     // Initialize population
     state.population = init_population(&config);
     println!("Initialized population with {} individuals", state.population.len());
-
-    // Tracker resource
-    commands.insert_resource(CreatureTracker::default());
 }
 
 fn setup_headless(
@@ -370,9 +369,10 @@ fn setup_headless(
     config: Res<EvolutionConfig>,
     mut state: ResMut<EvolutionState>,
 ) {
-    // Ground plane - just collider, no mesh
+    // Ground plane - just collider, no mesh - belongs to GROUP_2, collides with GROUP_1 (creature parts)
     commands.spawn((
         Collider::halfspace(Vec3::Y).unwrap(),
+        CollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
@@ -408,6 +408,12 @@ fn evolution_system(
     creatures: Query<Entity, With<TestCreature>>,
     creature_parts: Query<(&CreaturePart, &Transform)>,
 ) {
+    // Wait for physics to initialize
+    if state.frames_before_spawn > 0 {
+        state.frames_before_spawn -= 1;
+        return;
+    }
+
     let current_time = time.elapsed_secs();
 
     // Check if we need to spawn a new creature
@@ -473,7 +479,10 @@ fn evolution_system(
             count += 1;
         }
         if count > 0 {
-            tracker.center = total_pos / count as f32;
+            let new_center = total_pos / count as f32;
+            if new_center.is_finite() {
+                tracker.center = new_center;
+            }
         }
 
         // Check if test duration elapsed
@@ -525,6 +534,12 @@ fn evolution_system_headless(
     creatures: Query<Entity, With<TestCreature>>,
     creature_parts: Query<(&CreaturePart, &Transform)>,
 ) {
+    // Wait for physics to initialize
+    if state.frames_before_spawn > 0 {
+        state.frames_before_spawn -= 1;
+        return;
+    }
+
     let current_time = sim_time.elapsed;
 
     // Check if we need to spawn a new creature
@@ -582,7 +597,10 @@ fn evolution_system_headless(
             count += 1;
         }
         if count > 0 {
-            tracker.center = total_pos / count as f32;
+            let new_center = total_pos / count as f32;
+            if new_center.is_finite() {
+                tracker.center = new_center;
+            }
         }
 
         // Check if test duration elapsed
@@ -764,12 +782,17 @@ fn spawn_part_headless(
 
     let dims = node.dimensions;
 
+    // Collision groups: creature parts only collide with ground, not each other
+    let creature_group = Group::GROUP_1;
+    let ground_group = Group::GROUP_2;
+
     // Spawn without mesh - just physics
     let mut entity_commands = commands.spawn((
         transform,
         RigidBody::Dynamic,
         Collider::cuboid(dims.x / 2.0, dims.y / 2.0, dims.z / 2.0),
         ColliderMassProperties::Mass(node.volume()),
+        CollisionGroups::new(creature_group, ground_group),
         CreaturePart {
             creature_id,
             node_id,
