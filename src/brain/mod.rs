@@ -10,7 +10,7 @@ use bevy_rapier3d::prelude::*;
 use std::collections::HashMap;
 
 use crate::genotype::*;
-use crate::phenotype::CreaturePart;
+use crate::phenotype::{CreatureBody, CreaturePart};
 
 /// Plugin for brain simulation
 pub struct BrainPlugin;
@@ -24,33 +24,35 @@ impl Plugin for BrainPlugin {
 /// Runtime state for a creature's brain
 #[derive(Component)]
 pub struct Brain {
-    /// Neuron output values (indexed by part instance, then neuron index)
-    pub neuron_outputs: HashMap<usize, Vec<f32>>,
-    /// Internal state for stateful neurons (oscillators, integrators, etc.)
-    pub neuron_state: HashMap<(usize, usize), f32>,
+    /// The genotype this brain is running
+    pub genotype: CreatureGenotype,
+    /// Neuron output values (indexed by (node_id, instance), then neuron index)
+    pub neuron_outputs: HashMap<(usize, usize), Vec<f32>>,
+    /// Internal state for stateful neurons (keyed by (node_id, instance, neuron_idx))
+    pub neuron_state: HashMap<(usize, usize, usize), f32>,
     /// Simulation time for oscillators
     pub time: f32,
     /// Central neuron outputs
     pub central_outputs: Vec<f32>,
-    /// Central neuron state
+    /// Central neuron state (keyed by neuron_idx)
     pub central_state: HashMap<usize, f32>,
+    /// Sensor values per part (keyed by (node_id, instance), then sensor index)
+    pub sensor_values: HashMap<(usize, usize), Vec<f32>>,
 }
 
 impl Brain {
-    pub fn new() -> Self {
+    pub fn new(genotype: CreatureGenotype) -> Self {
+        // Initialize central outputs
+        let central_count = genotype.central_nervous_system.neurons.len();
         Self {
+            genotype,
             neuron_outputs: HashMap::new(),
             neuron_state: HashMap::new(),
             time: 0.0,
-            central_outputs: Vec::new(),
+            central_outputs: vec![0.0; central_count],
             central_state: HashMap::new(),
+            sensor_values: HashMap::new(),
         }
-    }
-}
-
-impl Default for Brain {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -157,31 +159,289 @@ fn evaluate_neuron(
     }
 }
 
+/// Tracks parent-child relationships for neural connections
+struct PartRelations {
+    /// Parent node id for each node (None for root)
+    parent: HashMap<usize, usize>,
+    /// Child node ids for each node, indexed by connection order
+    children: HashMap<usize, Vec<usize>>,
+}
+
+/// Get input value for a neuron from its source
+fn get_input_value(
+    input: &NeuralInput,
+    weight: f32,
+    part_key: (usize, usize),
+    sensor_values: &HashMap<(usize, usize), Vec<f32>>,
+    neuron_outputs: &HashMap<(usize, usize), Vec<f32>>,
+    central_outputs: &[f32],
+    relations: &PartRelations,
+) -> f32 {
+    let raw = match input {
+        NeuralInput::Constant(v) => *v,
+        NeuralInput::Sensor(idx) => {
+            sensor_values.get(&part_key)
+                .and_then(|s| s.get(*idx))
+                .copied()
+                .unwrap_or(0.0)
+        }
+        NeuralInput::LocalNeuron(idx) => {
+            neuron_outputs.get(&part_key)
+                .and_then(|n| n.get(*idx))
+                .copied()
+                .unwrap_or(0.0)
+        }
+        NeuralInput::ParentNeuron(idx) => {
+            // Get parent node and look up its neuron output
+            relations.parent.get(&part_key.0)
+                .and_then(|parent_node| {
+                    // Use instance 0 for parent (simplified)
+                    neuron_outputs.get(&(*parent_node, 0))
+                })
+                .and_then(|n| n.get(*idx))
+                .copied()
+                .unwrap_or(0.0)
+        }
+        NeuralInput::ChildNeuron { connection, neuron } => {
+            // Get child at specified connection index
+            relations.children.get(&part_key.0)
+                .and_then(|children| children.get(*connection))
+                .and_then(|child_node| {
+                    // Use instance 0 for child (simplified)
+                    neuron_outputs.get(&(*child_node, 0))
+                })
+                .and_then(|n| n.get(*neuron))
+                .copied()
+                .unwrap_or(0.0)
+        }
+        NeuralInput::CentralNeuron(idx) => {
+            central_outputs.get(*idx).copied().unwrap_or(0.0)
+        }
+    };
+    raw * weight
+}
+
 /// System to run all creature brains
 fn run_brains(
     time: Res<Time>,
-    mut brains: Query<&mut Brain>,
-    mut joints: Query<(&CreaturePart, &mut ImpulseJoint)>,
+    mut brains: Query<(Entity, &mut Brain, &CreatureBody)>,
+    mut parts_query: Query<(&CreaturePart, &mut ImpulseJoint, &GlobalTransform)>,
 ) {
     let dt = time.delta_secs();
 
-    for mut brain in brains.iter_mut() {
+    for (creature_entity, mut brain, body) in brains.iter_mut() {
         brain.time += dt;
+        let brain_time = brain.time;
 
-        // For now, just run simple oscillators to make creatures move
-        // Full neural network evaluation would go here
+        // Collect part info for this creature
+        let mut part_joints: HashMap<(usize, usize), Entity> = HashMap::new();
 
-        // Apply simple oscillating forces to all joints
-        let osc = (brain.time * 3.0).sin();
+        for &part_entity in &body.parts {
+            if let Ok((part, _, _)) = parts_query.get(part_entity) {
+                if part.creature_id == creature_entity {
+                    let key = (part.node_id.0, part.instance);
+                    part_joints.insert(key, part_entity);
+                }
+            }
+        }
 
-        for (_part, mut joint) in joints.iter_mut() {
-            // Apply motor to the joint based on oscillation
-            let motor_velocity = osc * 5.0;
+        // Build parent-child relationships from morphology graph
+        let mut relations = PartRelations {
+            parent: HashMap::new(),
+            children: HashMap::new(),
+        };
+        for conn in brain.genotype.morphology.connections() {
+            // Record parent relationship
+            relations.parent.insert(conn.to.0, conn.from.0);
+            // Record child relationship (append to children list)
+            relations.children.entry(conn.from.0).or_default().push(conn.to.0);
+        }
 
-            // Set motor on the underlying generic joint
-            let raw = joint.data.as_mut();
-            raw.set_motor_velocity(JointAxis::AngX, motor_velocity, 0.8);
-            raw.set_motor_max_force(JointAxis::AngX, 100.0);
+        // Read sensor values for each part
+        for (&part_key, &part_entity) in &part_joints {
+            let node_id = NodeId(part_key.0);
+            if let Some(node) = brain.genotype.morphology.get_node(node_id) {
+                let mut sensors = Vec::new();
+
+                for sensor in &node.neural.sensors {
+                    let value = match sensor {
+                        SensorType::JointAngle { dof } => {
+                            // Return joint motor velocity for the specified DOF
+                            // In a full implementation, we'd track actual joint angles
+                            // For now, use position-based approximation from transform
+                            if let Ok((_, joint, transform)) = parts_query.get(part_entity) {
+                                let axis = match dof {
+                                    0 => JointAxis::AngX,
+                                    1 => JointAxis::AngY,
+                                    _ => JointAxis::AngZ,
+                                };
+                                // Get motor target velocity as proxy for angle
+                                let motor = joint.data.as_ref().motor(axis);
+                                motor.map(|m| m.target_vel).unwrap_or_else(|| {
+                                    // Fallback: use orientation component
+                                    let euler = transform.rotation().to_euler(EulerRot::XYZ);
+                                    match dof {
+                                        0 => euler.0,
+                                        1 => euler.1,
+                                        _ => euler.2,
+                                    }
+                                })
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::Contact { face } => {
+                            // Contact sensing based on face direction
+                            // Use simplified ground contact detection
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let pos = transform.translation();
+                                // Check if face is pointing downward and close to ground
+                                let face_normal = match face {
+                                    Face::PosX => transform.right(),
+                                    Face::NegX => -transform.right(),
+                                    Face::PosY => transform.up(),
+                                    Face::NegY => -transform.up(),
+                                    Face::PosZ => transform.forward(),
+                                    Face::NegZ => -transform.forward(),
+                                };
+                                // Activate if face is pointing down and part is near ground
+                                if face_normal.y < -0.5 && pos.y < 0.5 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::PhotoSensor { axis } => {
+                            // Simplified photosensor: detect light direction
+                            // Returns how much the specified axis points toward light (up)
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let up = transform.up();
+                                match axis {
+                                    SensorAxis::X => up.x,
+                                    SensorAxis::Y => up.y,
+                                    SensorAxis::Z => up.z,
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                    };
+                    sensors.push(value);
+                }
+
+                brain.sensor_values.insert(part_key, sensors);
+            }
+        }
+
+        // Evaluate central nervous system first
+        // Clone the CNS neurons to avoid borrow issues
+        let cns_neurons: Vec<_> = brain.genotype.central_nervous_system.neurons.clone();
+        let mut new_central_outputs = vec![0.0; cns_neurons.len()];
+
+        for (neuron_idx, neuron) in cns_neurons.iter().enumerate() {
+            let mut inputs = Vec::new();
+            for weighted_input in &neuron.inputs {
+                let value = get_input_value(
+                    &weighted_input.source,
+                    weighted_input.weight,
+                    (0, 0), // Central neurons don't have a part
+                    &brain.sensor_values,
+                    &brain.neuron_outputs,
+                    &brain.central_outputs,
+                    &relations,
+                );
+                inputs.push(value);
+            }
+
+            let state = brain.central_state.entry(neuron_idx).or_insert(0.0);
+            new_central_outputs[neuron_idx] = evaluate_neuron(
+                neuron.func,
+                &inputs,
+                state,
+                brain_time,
+                dt,
+            );
+        }
+        brain.central_outputs = new_central_outputs;
+
+        // Evaluate each part's neural network
+        // First collect what we need to avoid borrow issues
+        let part_neurons: Vec<_> = part_joints.keys()
+            .filter_map(|&part_key| {
+                let node_id = NodeId(part_key.0);
+                brain.genotype.morphology.get_node(node_id)
+                    .map(|node| (part_key, node.neural.neurons.clone()))
+            })
+            .collect();
+
+        for (part_key, neurons) in part_neurons {
+            let mut outputs = vec![0.0; neurons.len()];
+
+            // Evaluate neurons in order (assumes topological ordering)
+            for (neuron_idx, neuron) in neurons.iter().enumerate() {
+                let mut inputs = Vec::new();
+                for weighted_input in &neuron.inputs {
+                    let value = get_input_value(
+                        &weighted_input.source,
+                        weighted_input.weight,
+                        part_key,
+                        &brain.sensor_values,
+                        &brain.neuron_outputs,
+                        &brain.central_outputs,
+                        &relations,
+                    );
+                    inputs.push(value);
+                }
+
+                let state_key = (part_key.0, part_key.1, neuron_idx);
+                let state = brain.neuron_state.entry(state_key).or_insert(0.0);
+                outputs[neuron_idx] = evaluate_neuron(
+                    neuron.func,
+                    &inputs,
+                    state,
+                    brain_time,
+                    dt,
+                );
+            }
+
+            brain.neuron_outputs.insert(part_key, outputs);
+        }
+
+        // Apply effector outputs to joints
+        for (&part_key, &part_entity) in &part_joints {
+            let node_id = NodeId(part_key.0);
+            if let Some(node) = brain.genotype.morphology.get_node(node_id) {
+                if let Ok((_, mut joint, _)) = parts_query.get_mut(part_entity) {
+                    for effector in &node.neural.effectors {
+                        // Get effector input value
+                        let value = get_input_value(
+                            &effector.input.source,
+                            effector.input.weight,
+                            part_key,
+                            &brain.sensor_values,
+                            &brain.neuron_outputs,
+                            &brain.central_outputs,
+                            &relations,
+                        );
+
+                        // Apply to the appropriate joint DOF
+                        let axis = match effector.dof {
+                            0 => JointAxis::AngX,
+                            1 => JointAxis::AngY,
+                            _ => JointAxis::AngZ,
+                        };
+
+                        // Set motor velocity based on effector output
+                        let motor_velocity = value * 5.0; // Scale factor
+                        let raw = joint.data.as_mut();
+                        raw.set_motor_velocity(axis, motor_velocity, 0.8);
+                        raw.set_motor_max_force(axis, effector.max_force);
+                    }
+                }
+            }
         }
     }
 }

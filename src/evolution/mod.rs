@@ -101,20 +101,62 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
         // Maybe add symmetric counterpart
         if rng.gen_bool(0.5) {
             let sym_node = random_morphology_node(rng, false);
+            // Choose reflection axis - X is most common for bilateral symmetry
+            let reflect_axis = match rng.gen_range(0..10) {
+                0 => ReflectAxis::Y,  // Less common
+                1 => ReflectAxis::Z,  // Less common
+                _ => ReflectAxis::X,  // Most common - bilateral symmetry
+            };
             let sym_conn = genotype.morphology.connections_from(parent)
                 .last()
-                .map(|c| c.data.reflected(ReflectAxis::X))
+                .map(|c| c.data.reflected(reflect_axis))
                 .unwrap_or_else(|| random_connection(rng));
             genotype.add_part(parent, sym_node, sym_conn);
         }
     }
 
-    // Add simple neural oscillators to each part
-    for (node_id, node) in genotype.morphology.nodes_mut() {
+    // Add sensors and neural oscillators to each part
+    for (_node_id, node) in genotype.morphology.nodes_mut() {
+        let dof = node.joint_type.dof();
+
+        // Add joint angle sensors for each DOF
+        for d in 0..dof {
+            node.neural.add_sensor(SensorType::JointAngle { dof: d });
+        }
+
+        // Maybe add a photosensor
+        if rng.gen_bool(0.3) {
+            let axis = match rng.gen_range(0..3) {
+                0 => SensorAxis::X,
+                1 => SensorAxis::Y,
+                _ => SensorAxis::Z,
+            };
+            node.neural.add_sensor(SensorType::PhotoSensor { axis });
+        }
+
+        // Maybe add contact sensors on different faces
+        if rng.gen_bool(0.2) {
+            let face = match rng.gen_range(0..6) {
+                0 => Face::PosX,
+                1 => Face::NegX,
+                2 => Face::PosY,
+                3 => Face::NegY,
+                4 => Face::PosZ,
+                _ => Face::NegZ,
+            };
+            node.neural.add_sensor(SensorType::Contact { face });
+        }
+
         if node.joint_type != JointType::Rigid {
-            // Add an oscillator neuron
+            // Add an oscillator neuron with random frequency
+            let osc_func = if rng.gen_bool(0.7) {
+                NeuronFunc::OscillateWave
+            } else {
+                NeuronFunc::OscillateSaw
+            };
+
             let oscillator = Neuron {
-                func: NeuronFunc::OscillateWave,
+                func: osc_func,
                 inputs: vec![WeightedInput {
                     source: NeuralInput::Constant(rng.gen_range(0.5..3.0)),
                     weight: 1.0,
@@ -122,16 +164,154 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
             };
             let osc_idx = node.neural.add_neuron(oscillator);
 
-            // Add effector connected to oscillator
-            let effector = Effector {
-                dof: 0,
-                input: WeightedInput {
-                    source: NeuralInput::LocalNeuron(osc_idx),
-                    weight: rng.gen_range(1.0..5.0),
-                },
-                max_force: 100.0,
+            // Maybe add a processing neuron that uses sensor input
+            let output_idx = if !node.neural.sensors.is_empty() && rng.gen_bool(0.5) {
+                // Add a neuron that modulates based on sensor
+                let sensor_idx = rng.gen_range(0..node.neural.sensors.len());
+                // Use the full range of neuron functions
+                let proc_func = match rng.gen_range(0..21) {
+                    0 => NeuronFunc::Sum,
+                    1 => NeuronFunc::Product,
+                    2 => NeuronFunc::Divide,
+                    3 => NeuronFunc::SumThreshold,
+                    4 => NeuronFunc::GreaterThan,
+                    5 => NeuronFunc::SignOf,
+                    6 => NeuronFunc::Min,
+                    7 => NeuronFunc::Max,
+                    8 => NeuronFunc::Abs,
+                    9 => NeuronFunc::If,
+                    10 => NeuronFunc::Interpolate,
+                    11 => NeuronFunc::Sin,
+                    12 => NeuronFunc::Cos,
+                    13 => NeuronFunc::Atan,
+                    14 => NeuronFunc::Log,
+                    15 => NeuronFunc::Exp,
+                    16 => NeuronFunc::Sigmoid,
+                    17 => NeuronFunc::Integrate,
+                    18 => NeuronFunc::Differentiate,
+                    19 => NeuronFunc::Smooth,
+                    _ => NeuronFunc::Memory,
+                };
+
+                // Build appropriate inputs based on function arity
+                let inputs = match proc_func.num_inputs() {
+                    1 => vec![
+                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                    ],
+                    3 => vec![
+                        WeightedInput { source: NeuralInput::Sensor(sensor_idx), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::Constant(-1.0), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                    ],
+                    _ => vec![
+                        WeightedInput { source: NeuralInput::LocalNeuron(osc_idx), weight: 1.0 },
+                        WeightedInput { source: NeuralInput::Sensor(sensor_idx), weight: rng.gen_range(0.1..1.0) },
+                    ],
+                };
+
+                let proc_neuron = Neuron { func: proc_func, inputs };
+                node.neural.add_neuron(proc_neuron)
+            } else {
+                osc_idx
             };
-            node.neural.add_effector(effector);
+
+            // Add effectors for each DOF, scaling by cross-section for realism
+            let force_scale = node.max_cross_section();
+            for d in 0..dof {
+                let effector = Effector {
+                    dof: d,
+                    input: WeightedInput {
+                        source: NeuralInput::LocalNeuron(output_idx),
+                        weight: rng.gen_range(1.0..5.0),
+                    },
+                    max_force: rng.gen_range(50.0..200.0) * force_scale,
+                };
+                node.neural.add_effector(effector);
+            }
+        }
+    }
+
+    // Add central nervous system neurons for global coordination
+    let num_parts = genotype.part_type_count();
+    if num_parts > 1 && rng.gen_bool(0.5) {
+        // Add a central oscillator that parts can reference
+        let central_osc = Neuron {
+            func: NeuronFunc::OscillateWave,
+            inputs: vec![WeightedInput {
+                source: NeuralInput::Constant(rng.gen_range(0.3..1.5)),
+                weight: 1.0,
+            }],
+        };
+        genotype.central_nervous_system.neurons.push(central_osc);
+
+        // Maybe add a processing neuron that combines inputs
+        if rng.gen_bool(0.3) {
+            let proc_neuron = Neuron {
+                func: NeuronFunc::Smooth,
+                inputs: vec![WeightedInput {
+                    source: NeuralInput::CentralNeuron(0),
+                    weight: 1.0,
+                }],
+            };
+            genotype.central_nervous_system.neurons.push(proc_neuron);
+        }
+    }
+
+    // Add inter-part neural connections to some parts
+    // This creates more complex coordination between body parts
+    for (node_id, node) in genotype.morphology.nodes_mut() {
+        if node_id.0 > 0 && !node.neural.neurons.is_empty() && rng.gen_bool(0.3) {
+            // Add a neuron that receives input from parent
+            let parent_input_neuron = Neuron {
+                func: NeuronFunc::Sum,
+                inputs: vec![
+                    WeightedInput {
+                        source: NeuralInput::ParentNeuron(0),
+                        weight: rng.gen_range(0.5..1.5),
+                    },
+                    WeightedInput {
+                        source: NeuralInput::LocalNeuron(0),
+                        weight: rng.gen_range(0.5..1.5),
+                    },
+                ],
+            };
+            node.neural.add_neuron(parent_input_neuron);
+        }
+
+        // Maybe add child neuron input
+        if rng.gen_bool(0.2) && !node.neural.neurons.is_empty() {
+            let child_input_neuron = Neuron {
+                func: NeuronFunc::Sum,
+                inputs: vec![
+                    WeightedInput {
+                        source: NeuralInput::ChildNeuron { connection: 0, neuron: 0 },
+                        weight: rng.gen_range(0.3..1.0),
+                    },
+                    WeightedInput {
+                        source: NeuralInput::LocalNeuron(0),
+                        weight: 1.0,
+                    },
+                ],
+            };
+            node.neural.add_neuron(child_input_neuron);
+        }
+
+        // Maybe reference central nervous system
+        if !genotype.central_nervous_system.neurons.is_empty() && rng.gen_bool(0.4) {
+            let cns_input_neuron = Neuron {
+                func: NeuronFunc::Product,
+                inputs: vec![
+                    WeightedInput {
+                        source: NeuralInput::CentralNeuron(0),
+                        weight: 1.0,
+                    },
+                    WeightedInput {
+                        source: NeuralInput::LocalNeuron(0),
+                        weight: 1.0,
+                    },
+                ],
+            };
+            node.neural.add_neuron(cns_input_neuron);
         }
     }
 
@@ -148,11 +328,14 @@ fn random_morphology_node(rng: &mut impl Rng, is_root: bool) -> MorphologyNode {
     let joint_type = if is_root {
         JointType::Rigid
     } else {
-        match rng.gen_range(0..4) {
+        match rng.gen_range(0..7) {
             0 => JointType::Revolute,
             1 => JointType::Twist,
             2 => JointType::Universal,
-            _ => JointType::Spherical,
+            3 => JointType::BendTwist,
+            4 => JointType::TwistBend,
+            5 => JointType::Spherical,
+            _ => JointType::Revolute, // Default to simple revolute
         }
     };
 
@@ -191,8 +374,9 @@ fn random_connection(rng: &mut impl Rng) -> MorphologyConnection {
 
 /// Mutate a genotype in place
 pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
-    // Scale mutation rate by complexity (smaller creatures mutate more)
-    let scale = 1.0 / (genotype.morphology.node_count() as f32).sqrt();
+    // Scale mutation rate by complexity (consider both nodes and connections)
+    let complexity = genotype.morphology.node_count() + genotype.morphology.connection_count();
+    let scale = 1.0 / (complexity as f32).sqrt();
     let adjusted_rate = rate * scale;
 
     // Mutate each node
@@ -209,9 +393,20 @@ pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
     if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 10 {
         let parents: Vec<_> = genotype.morphology.nodes().map(|(id, _)| id).collect();
         if let Some(&parent) = parents.choose(rng) {
-            let new_node = random_morphology_node(rng, false);
-            let new_conn = random_connection(rng);
-            genotype.add_part(parent, new_node, new_conn);
+            // Validate the parent node exists before adding part
+            if genotype.morphology.is_valid(parent) {
+                let new_node = random_morphology_node(rng, false);
+                let new_conn = random_connection(rng);
+                genotype.add_part(parent, new_node, new_conn);
+            }
+        }
+    }
+
+    // Maybe mutate a specific node's recursive limit using get_node_mut
+    if rng.gen_bool((adjusted_rate * 0.1) as f64) {
+        let node_id = NodeId(rng.gen_range(0..genotype.morphology.node_count()));
+        if let Some(node) = genotype.morphology.get_node_mut(node_id) {
+            node.recursive_limit = rng.gen_range(1..=4);
         }
     }
 
@@ -219,7 +414,7 @@ pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
     if rng.gen_bool((adjusted_rate * 0.1) as f64) && genotype.morphology.node_count() > 2 {
         // Note: actual removal would require more complex graph surgery
         // For now, we just reduce recursive_limit of a random node
-        let nodes: Vec<_> = genotype.morphology.nodes_mut()
+        let _nodes: Vec<_> = genotype.morphology.nodes_mut()
             .filter(|(id, _)| *id != genotype.root)
             .collect();
         // Can't easily mutate here due to borrow, skip for now
@@ -441,12 +636,18 @@ pub fn reproduce(population: &mut Vec<Individual>, target_size: usize, config: &
             let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
             mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
             child
-        } else {
-            // Grafting
+        } else if roll < config.asexual_prob + config.crossover_prob + config.grafting_prob {
+            // Grafting: take a subtree from one parent and attach to another
             let p1 = survivors.choose(&mut rng).unwrap();
             let p2 = survivors.choose(&mut rng).unwrap();
             let mut child = graft(&p1.genotype, &p2.genotype, &mut rng);
             mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
+            child
+        } else {
+            // Fallback: asexual reproduction
+            let parent = survivors.choose(&mut rng).unwrap();
+            let mut child = parent.genotype.clone();
+            mutate(&mut child, &mut rng, config.mutation_rate);
             child
         };
 

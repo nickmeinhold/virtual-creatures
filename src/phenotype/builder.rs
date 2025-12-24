@@ -1,10 +1,41 @@
 //! Phenotype builder - spawns creatures from genotypes.
 
 use bevy::prelude::*;
+use bevy_rapier3d::dynamics::TypedJoint;
 use bevy_rapier3d::prelude::*;
 use std::collections::HashMap;
 
 use crate::genotype::*;
+
+/// Context for spawning a creature (immutable during spawn)
+struct SpawnContext<'a> {
+    genotype: &'a CreatureGenotype,
+    creature_id: Entity,
+}
+
+/// Mutable state tracked during spawning
+struct SpawnState {
+    node_instances: HashMap<NodeId, usize>,
+    spawned_parts: Vec<Entity>,
+}
+
+/// Information about a parent part for spawning children
+struct ParentInfo<'a> {
+    node_id: NodeId,
+    entity: Entity,
+    node: &'a MorphologyNode,
+    transform: Transform,
+    reflection: Vec3,
+}
+
+/// Information about a part to spawn
+struct PartSpawnInfo<'a> {
+    creature_id: Entity,
+    node_id: NodeId,
+    instance: usize,
+    node: &'a MorphologyNode,
+    transform: Transform,
+}
 
 /// Marker component for creature parts
 #[derive(Component)]
@@ -30,20 +61,18 @@ pub struct CreatureBody {
 
 /// Result of spawning a creature
 pub struct SpawnedCreature {
-    /// The root entity
+    /// The creature entity (has CreatureBody and Brain)
+    pub creature_entity: Entity,
+    /// The root part entity
     pub root: Entity,
     /// All part entities
     pub parts: Vec<Entity>,
 }
 
 /// Builder for spawning creatures from genotypes
-pub struct PhenotypeBuilder<'a> {
-    commands: &'a mut Commands<'a, 'a>,
-    meshes: &'a mut Assets<Mesh>,
-    materials: &'a mut Assets<StandardMaterial>,
-}
+pub struct PhenotypeBuilder;
 
-impl<'a> PhenotypeBuilder<'a> {
+impl PhenotypeBuilder {
     /// Spawn a creature from a genotype at the given position
     pub fn spawn(
         commands: &mut Commands,
@@ -52,43 +81,47 @@ impl<'a> PhenotypeBuilder<'a> {
         genotype: &CreatureGenotype,
         position: Vec3,
     ) -> SpawnedCreature {
-        let mut spawned_parts = Vec::new();
-        let mut node_instances: HashMap<NodeId, usize> = HashMap::new();
+        let mut state = SpawnState {
+            node_instances: HashMap::new(),
+            spawned_parts: Vec::new(),
+        };
 
         // Create a placeholder root entity first
         let creature_id = commands.spawn_empty().id();
 
         // Spawn the root part
         let root_node = &genotype.morphology[genotype.root];
-        let root_entity = Self::spawn_part(
-            commands,
-            meshes,
-            materials,
+        let root_transform = Transform::from_translation(position);
+        let root_info = PartSpawnInfo {
             creature_id,
-            genotype.root,
-            0,
-            root_node,
-            Transform::from_translation(position),
-            None,
-            Vec3::ONE, // no reflection
-        );
-        spawned_parts.push(root_entity);
-        node_instances.insert(genotype.root, 1);
+            node_id: genotype.root,
+            instance: 0,
+            node: root_node,
+            transform: root_transform,
+        };
+        let root_entity = Self::spawn_part(commands, meshes, materials, &root_info, None);
+        state.spawned_parts.push(root_entity);
+        state.node_instances.insert(genotype.root, 1);
 
         // Recursively spawn children
+        let ctx = SpawnContext {
+            genotype,
+            creature_id,
+        };
+        let root_parent = ParentInfo {
+            node_id: genotype.root,
+            entity: root_entity,
+            node: root_node,
+            transform: root_transform,
+            reflection: Vec3::ONE,
+        };
         Self::spawn_children(
             commands,
             meshes,
             materials,
-            genotype,
-            creature_id,
-            genotype.root,
-            root_entity,
-            root_node,
-            Transform::from_translation(position),
-            Vec3::ONE,
-            &mut node_instances,
-            &mut spawned_parts,
+            &ctx,
+            &root_parent,
+            &mut state,
             0, // recursion depth
         );
 
@@ -96,7 +129,7 @@ impl<'a> PhenotypeBuilder<'a> {
         commands.entity(creature_id).insert((
             CreatureRoot,
             CreatureBody {
-                parts: spawned_parts.clone(),
+                parts: state.spawned_parts.clone(),
             },
         ));
 
@@ -104,8 +137,9 @@ impl<'a> PhenotypeBuilder<'a> {
         commands.entity(root_entity).insert(CreatureRoot);
 
         SpawnedCreature {
+            creature_entity: creature_id,
             root: root_entity,
-            parts: spawned_parts,
+            parts: state.spawned_parts,
         }
     }
 
@@ -113,15 +147,9 @@ impl<'a> PhenotypeBuilder<'a> {
         commands: &mut Commands,
         meshes: &mut Assets<Mesh>,
         materials: &mut Assets<StandardMaterial>,
-        genotype: &CreatureGenotype,
-        creature_id: Entity,
-        parent_node_id: NodeId,
-        parent_entity: Entity,
-        parent_node: &MorphologyNode,
-        parent_transform: Transform,
-        parent_reflection: Vec3,
-        node_instances: &mut HashMap<NodeId, usize>,
-        spawned_parts: &mut Vec<Entity>,
+        ctx: &SpawnContext,
+        parent: &ParentInfo,
+        state: &mut SpawnState,
         depth: usize,
     ) {
         const MAX_DEPTH: usize = 10; // prevent infinite recursion
@@ -129,11 +157,11 @@ impl<'a> PhenotypeBuilder<'a> {
             return;
         }
 
-        for conn in genotype.morphology.connections_from(parent_node_id) {
-            let child_node = &genotype.morphology[conn.to];
+        for conn in ctx.genotype.morphology.connections_from(parent.node_id) {
+            let child_node = &ctx.genotype.morphology[conn.to];
 
             // Check recursive limit
-            let instance_count = node_instances.get(&conn.to).copied().unwrap_or(0);
+            let instance_count = state.node_instances.get(&conn.to).copied().unwrap_or(0);
             if instance_count >= child_node.recursive_limit as usize {
                 continue;
             }
@@ -145,45 +173,47 @@ impl<'a> PhenotypeBuilder<'a> {
             }
 
             // Compute child transform
-            let combined_reflection = parent_reflection * conn.data.reflection;
+            let combined_reflection = parent.reflection * conn.data.reflection;
             let child_transform = Self::compute_child_transform(
-                &parent_transform,
-                parent_node,
+                &parent.transform,
+                parent.node,
                 &conn.data,
                 combined_reflection,
             );
 
             // Spawn the child part
-            let instance = instance_count;
+            let child_info = PartSpawnInfo {
+                creature_id: ctx.creature_id,
+                node_id: conn.to,
+                instance: instance_count,
+                node: child_node,
+                transform: child_transform,
+            };
             let child_entity = Self::spawn_part(
                 commands,
                 meshes,
                 materials,
-                creature_id,
-                conn.to,
-                instance,
-                child_node,
-                child_transform,
-                Some((parent_entity, parent_node, &conn.data)),
-                combined_reflection,
+                &child_info,
+                Some((parent.entity, parent.node, &conn.data)),
             );
-            spawned_parts.push(child_entity);
-            *node_instances.entry(conn.to).or_insert(0) += 1;
+            state.spawned_parts.push(child_entity);
+            *state.node_instances.entry(conn.to).or_insert(0) += 1;
 
             // Recurse to spawn grandchildren
+            let child_parent = ParentInfo {
+                node_id: conn.to,
+                entity: child_entity,
+                node: child_node,
+                transform: child_transform,
+                reflection: combined_reflection,
+            };
             Self::spawn_children(
                 commands,
                 meshes,
                 materials,
-                genotype,
-                creature_id,
-                conn.to,
-                child_entity,
-                child_node,
-                child_transform,
-                combined_reflection,
-                node_instances,
-                spawned_parts,
+                ctx,
+                &child_parent,
+                state,
                 depth + 1,
             );
         }
@@ -193,36 +223,32 @@ impl<'a> PhenotypeBuilder<'a> {
         commands: &mut Commands,
         meshes: &mut Assets<Mesh>,
         materials: &mut Assets<StandardMaterial>,
-        creature_id: Entity,
-        node_id: NodeId,
-        instance: usize,
-        node: &MorphologyNode,
-        transform: Transform,
+        info: &PartSpawnInfo,
         parent_info: Option<(Entity, &MorphologyNode, &MorphologyConnection)>,
-        _reflection: Vec3,
     ) -> Entity {
-        let dims = node.dimensions;
+        let dims = info.node.dimensions;
 
         // Create mesh and material
         let mesh = meshes.add(Cuboid::new(dims.x, dims.y, dims.z));
         let material = materials.add(Color::srgb(
-            0.5 + 0.3 * (node_id.0 as f32 * 0.7).sin(),
-            0.5 + 0.3 * (node_id.0 as f32 * 1.3).cos(),
-            0.5 + 0.3 * (node_id.0 as f32 * 2.1).sin(),
+            0.5 + 0.3 * (info.node_id.0 as f32 * 0.7).sin(),
+            0.5 + 0.3 * (info.node_id.0 as f32 * 1.3).cos(),
+            0.5 + 0.3 * (info.node_id.0 as f32 * 2.1).sin(),
         ));
 
         // Spawn the entity
         let mut entity_commands = commands.spawn((
             Mesh3d(mesh),
             MeshMaterial3d(material),
-            transform,
+            info.transform,
             RigidBody::Dynamic,
             Collider::cuboid(dims.x / 2.0, dims.y / 2.0, dims.z / 2.0),
-            ColliderMassProperties::Density(1.0),
+            // Use volume-based mass (density 1.0 kg/m³)
+            ColliderMassProperties::Mass(info.node.volume()),
             CreaturePart {
-                creature_id,
-                node_id,
-                instance,
+                creature_id: info.creature_id,
+                node_id: info.node_id,
+                instance: info.instance,
             },
         ));
 
@@ -230,8 +256,11 @@ impl<'a> PhenotypeBuilder<'a> {
 
         // Add joint to parent if this isn't the root
         if let Some((parent_entity, parent_node, connection)) = parent_info {
-            let joint = Self::create_joint(node, parent_node, connection);
-            entity_commands.insert(ImpulseJoint::new(parent_entity, joint));
+            let joint = Self::create_joint(info.node, parent_node, connection);
+            entity_commands.insert(ImpulseJoint {
+                parent: parent_entity,
+                data: TypedJoint::GenericJoint(joint),
+            });
         }
 
         entity
@@ -298,7 +327,7 @@ impl<'a> PhenotypeBuilder<'a> {
         child_node: &MorphologyNode,
         parent_node: &MorphologyNode,
         connection: &MorphologyConnection,
-    ) -> impl Into<TypedJoint> {
+    ) -> GenericJoint {
         let parent_half = parent_node.dimensions / 2.0;
         let child_half = child_node.dimensions / 2.0;
 
@@ -309,10 +338,65 @@ impl<'a> PhenotypeBuilder<'a> {
         let conn_dir = connection.position.normalize_or_zero();
         let child_anchor = -conn_dir * child_half;
 
-        // We use SphericalJoint for all types for now, as it's the most flexible
-        // Different joint types can be simulated by adjusting motor targets
-        SphericalJointBuilder::new()
-            .local_anchor1(parent_anchor)
-            .local_anchor2(child_anchor)
+        // Create joint based on joint type
+        let mut joint = match child_node.joint_type {
+            JointType::Rigid => {
+                // Fixed joint - no movement
+                GenericJointBuilder::new(JointAxesMask::LOCKED_FIXED_AXES)
+                    .local_anchor1(parent_anchor)
+                    .local_anchor2(child_anchor)
+                    .build()
+            }
+            JointType::Revolute => {
+                // 1 DOF rotation around X axis
+                GenericJointBuilder::new(JointAxesMask::LOCKED_REVOLUTE_AXES)
+                    .local_anchor1(parent_anchor)
+                    .local_anchor2(child_anchor)
+                    .build()
+            }
+            JointType::Twist => {
+                // 1 DOF rotation around attachment axis (Z)
+                let mut axes = JointAxesMask::LOCKED_FIXED_AXES;
+                axes.set(JointAxesMask::ANG_Z, false); // Free Z rotation
+                GenericJointBuilder::new(axes)
+                    .local_anchor1(parent_anchor)
+                    .local_anchor2(child_anchor)
+                    .build()
+            }
+            JointType::Universal | JointType::BendTwist | JointType::TwistBend => {
+                // 2 DOF rotation around X and Y axes
+                let mut axes = JointAxesMask::LOCKED_FIXED_AXES;
+                axes.set(JointAxesMask::ANG_X, false);
+                axes.set(JointAxesMask::ANG_Y, false);
+                GenericJointBuilder::new(axes)
+                    .local_anchor1(parent_anchor)
+                    .local_anchor2(child_anchor)
+                    .build()
+            }
+            JointType::Spherical => {
+                // 3 DOF - full rotation freedom
+                GenericJointBuilder::new(JointAxesMask::LOCKED_SPHERICAL_AXES)
+                    .local_anchor1(parent_anchor)
+                    .local_anchor2(child_anchor)
+                    .build()
+            }
+        };
+
+        // Apply joint limits from the genotype
+        for (dof_idx, &(min, max)) in child_node.joint_limits.limits.iter().enumerate() {
+            let axis = match dof_idx {
+                0 => JointAxis::AngX,
+                1 => JointAxis::AngY,
+                _ => JointAxis::AngZ,
+            };
+            joint.set_limits(axis, [min, max]);
+
+            // Apply stiffness as motor damping when approaching limits
+            // Higher stiffness means stronger resistance at limits
+            let stiffness = child_node.joint_limits.stiffness;
+            joint.set_motor(axis, 0.0, 0.0, 0.0, stiffness);
+        }
+
+        joint
     }
 }

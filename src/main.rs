@@ -6,9 +6,8 @@ mod evolution;
 mod genotype;
 mod phenotype;
 
-use brain::*;
+use brain::{Brain, BrainPlugin};
 use evolution::*;
-use genotype::*;
 use phenotype::*;
 
 fn main() {
@@ -74,6 +73,7 @@ fn setup(
 }
 
 /// Main evolution system
+#[allow(clippy::too_many_arguments)]
 fn evolution_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -96,6 +96,10 @@ fn evolution_system(
             let individual = &state.population[state.current_individual];
             let spawn_pos = Vec3::new(0.0, 2.0, 0.0);
 
+            // Get root node info for logging before we use spawn
+            let root = individual.genotype.root_node();
+            let root_dims = root.dimensions;
+
             let spawned = PhenotypeBuilder::spawn(
                 &mut commands,
                 &mut meshes,
@@ -104,23 +108,35 @@ fn evolution_system(
                 spawn_pos,
             );
 
-            // Mark all parts as test creature and add brain
+            // Mark all parts as test creature, with special handling for root
             for entity in &spawned.parts {
                 commands.entity(*entity).insert(TestCreature);
             }
+            // Also mark the root part entity for easier identification
+            commands.entity(spawned.root).insert(TestCreature);
 
-            // Add brain to root
-            commands.entity(spawned.root).insert(Brain::new());
+            // Add brain to the creature entity (which has CreatureBody)
+            // The brain needs the genotype to evaluate neural networks
+            commands.entity(spawned.creature_entity).insert(Brain::new(individual.genotype.clone()));
+
+            let num_parts = spawned.parts.len();
+            let current = state.current_individual + 1;
+            let pop_size = state.population.len();
+            let gen = state.generation;
 
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
             tracker.center = spawn_pos;
 
             println!(
-                "Testing individual {}/{} (gen {})",
-                state.current_individual + 1,
-                state.population.len(),
-                state.generation
+                "Testing individual {}/{} (gen {}) - root size: {:.2}x{:.2}x{:.2}, {} parts",
+                current,
+                pop_size,
+                gen,
+                root_dims.x,
+                root_dims.y,
+                root_dims.z,
+                num_parts
             );
         }
     } else {

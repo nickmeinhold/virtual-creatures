@@ -4,8 +4,6 @@
 //! Each body part has its own local neural graph that gets instantiated
 //! when the phenotype is built.
 
-use super::graph::{DirectedGraph, NodeId};
-
 /// Sensor types that provide input signals
 #[derive(Debug, Clone)]
 pub enum SensorType {
@@ -14,7 +12,7 @@ pub enum SensorType {
     /// Contact sensor for a face of the part (activates on collision)
     Contact { face: Face },
     /// Photosensor - reacts to light source direction
-    PhotoSensor { axis: Axis },
+    PhotoSensor { axis: SensorAxis },
 }
 
 /// Which face of a box-shaped part
@@ -28,9 +26,9 @@ pub enum Face {
     NegZ,
 }
 
-/// Axis for photosensors
+/// Axis for photosensors (renamed to avoid bevy conflict)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Axis {
+pub enum SensorAxis {
     X,
     Y,
     Z,
