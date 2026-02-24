@@ -5,6 +5,7 @@
 //! - Neural control is nested within each body part node
 //! - Graphs can be recursive/cyclic for fractal-like structures
 
+pub mod analysis;
 mod graph;
 mod io;
 mod morphology;

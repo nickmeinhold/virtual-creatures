@@ -9,6 +9,7 @@
 
 use bevy::prelude::*;
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::genotype::*;
 
@@ -45,11 +46,37 @@ impl Default for EvolutionConfig {
     }
 }
 
+/// How a creature was created
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReproductionMethod {
+    /// Initial random generation
+    Random,
+    /// Asexual reproduction (copy + mutate)
+    Asexual { parent: u64 },
+    /// Sexual reproduction (crossover + mutate)
+    Crossover { parent1: u64, parent2: u64 },
+    /// Grafting (subtree splice + mutate)
+    Grafting { base: u64, donor: u64 },
+}
+
+/// Lineage information for tracking evolutionary history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lineage {
+    /// How this creature was created
+    pub method: ReproductionMethod,
+    /// Generation in which this creature was born
+    pub born_generation: usize,
+}
+
 /// An individual in the population
 #[derive(Clone)]
 pub struct Individual {
+    /// Unique identifier for this creature
+    pub id: u64,
     pub genotype: CreatureGenotype,
     pub fitness: f32,
+    /// Evolutionary lineage
+    pub lineage: Lineage,
 }
 
 /// Current state of evolution
@@ -67,6 +94,12 @@ pub struct EvolutionState {
     pub save_path: Option<String>,
     /// Frames to wait before spawning first creature (let physics initialize)
     pub frames_before_spawn: u32,
+    /// Next unique creature ID
+    pub next_id: u64,
+    /// Snapshot save interval (None = disabled)
+    pub snapshot_interval: Option<usize>,
+    /// Directory for population snapshots
+    pub snapshot_dir: Option<String>,
 }
 
 impl Default for EvolutionState {
@@ -81,7 +114,19 @@ impl Default for EvolutionState {
             archive: Some(CreatureArchive::new()),
             save_path: Some("creatures.json".to_string()),
             frames_before_spawn: 2,
+            next_id: 0,
+            snapshot_interval: None,
+            snapshot_dir: None,
         }
+    }
+}
+
+impl EvolutionState {
+    /// Allocate the next unique creature ID
+    pub fn next_creature_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 }
 
@@ -549,13 +594,21 @@ pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
 // Evolution Loop
 // ============================================================================
 
-/// Initialize the population
-pub fn init_population(config: &EvolutionConfig) -> Vec<Individual> {
+/// Initialize the population with unique IDs and lineage tracking
+pub fn init_population(config: &EvolutionConfig, state: &mut EvolutionState) -> Vec<Individual> {
     let mut rng = rand::thread_rng();
     (0..config.population_size)
-        .map(|_| Individual {
-            genotype: random_genotype(&mut rng),
-            fitness: 0.0,
+        .map(|_| {
+            let id = state.next_creature_id();
+            Individual {
+                id,
+                genotype: random_genotype(&mut rng),
+                fitness: 0.0,
+                lineage: Lineage {
+                    method: ReproductionMethod::Random,
+                    born_generation: 0,
+                },
+            }
         })
         .collect()
 }
@@ -570,45 +623,70 @@ pub fn select_survivors(population: &mut Vec<Individual>, survival_ratio: f32) {
     population.truncate(num_survivors.max(1));
 }
 
-/// Reproduce to fill population back up
-pub fn reproduce(population: &mut Vec<Individual>, target_size: usize, config: &EvolutionConfig) {
+/// Reproduce to fill population back up, tracking lineage
+pub fn reproduce(
+    population: &mut Vec<Individual>,
+    target_size: usize,
+    config: &EvolutionConfig,
+    next_id: &mut u64,
+    generation: usize,
+) {
     let mut rng = rand::thread_rng();
     let survivors = population.clone();
 
     while population.len() < target_size {
         let roll: f32 = rng.gen();
+        let id = *next_id;
+        *next_id += 1;
 
-        let child_genotype = if roll < config.asexual_prob {
+        let (child_genotype, method) = if roll < config.asexual_prob {
             // Asexual: mutate a copy
             let parent = survivors.choose(&mut rng).unwrap();
             let mut child = parent.genotype.clone();
             mutate(&mut child, &mut rng, config.mutation_rate);
-            child
+            (child, ReproductionMethod::Asexual { parent: parent.id })
         } else if roll < config.asexual_prob + config.crossover_prob {
             // Crossover
             let p1 = survivors.choose(&mut rng).unwrap();
             let p2 = survivors.choose(&mut rng).unwrap();
             let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
             mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
-            child
+            (
+                child,
+                ReproductionMethod::Crossover {
+                    parent1: p1.id,
+                    parent2: p2.id,
+                },
+            )
         } else if roll < config.asexual_prob + config.crossover_prob + config.grafting_prob {
-            // Grafting: take a subtree from one parent and attach to another
+            // Grafting
             let p1 = survivors.choose(&mut rng).unwrap();
             let p2 = survivors.choose(&mut rng).unwrap();
             let mut child = graft(&p1.genotype, &p2.genotype, &mut rng);
             mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
-            child
+            (
+                child,
+                ReproductionMethod::Grafting {
+                    base: p1.id,
+                    donor: p2.id,
+                },
+            )
         } else {
             // Fallback: asexual reproduction
             let parent = survivors.choose(&mut rng).unwrap();
             let mut child = parent.genotype.clone();
             mutate(&mut child, &mut rng, config.mutation_rate);
-            child
+            (child, ReproductionMethod::Asexual { parent: parent.id })
         };
 
         population.push(Individual {
+            id,
             genotype: child_genotype,
             fitness: 0.0,
+            lineage: Lineage {
+                method,
+                born_generation: generation,
+            },
         });
     }
 }
@@ -647,8 +725,24 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
         }
     }
 
+    // Save population snapshot if interval is set
+    let should_snapshot = state
+        .snapshot_interval
+        .map_or(false, |interval| state.generation % interval == 0);
+
+    if should_snapshot {
+        save_population_snapshot(state);
+    }
+
     // Reproduce
-    reproduce(&mut state.population, config.population_size, config);
+    let generation = state.generation;
+    reproduce(
+        &mut state.population,
+        config.population_size,
+        config,
+        &mut state.next_id,
+        generation,
+    );
 
     state.generation += 1;
     state.current_individual = 0;
@@ -657,6 +751,51 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
         "Generation {}: best fitness = {:.3}",
         state.generation, state.best_fitness
     );
+}
+
+/// Save a snapshot of the current population
+fn save_population_snapshot(state: &EvolutionState) {
+    use crate::genotype::analysis::MorphologyDescriptor;
+
+    let snapshot = PopulationSnapshot {
+        generation: state.generation,
+        individuals: state
+            .population
+            .iter()
+            .map(|ind| {
+                let descriptor = MorphologyDescriptor::from_genotype(&ind.genotype);
+                SavedIndividual {
+                    id: ind.id,
+                    genotype: ind.genotype.clone(),
+                    fitness: ind.fitness,
+                    lineage: ind.lineage.clone(),
+                    descriptor,
+                }
+            })
+            .collect(),
+    };
+
+    let dir = state
+        .snapshot_dir
+        .as_deref()
+        .unwrap_or("snapshots");
+
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("Warning: Failed to create snapshot dir: {}", e);
+        return;
+    }
+
+    let path = format!("{}/gen_{:04}.json", dir, state.generation);
+    match serde_json::to_string_pretty(&snapshot) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("Warning: Failed to save snapshot: {}", e);
+            } else {
+                println!("Saved population snapshot to {}", path);
+            }
+        }
+        Err(e) => eprintln!("Warning: Failed to serialize snapshot: {}", e),
+    }
 }
 
 /// Count how many parts would be spawned from a genotype
