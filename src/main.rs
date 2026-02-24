@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 use std::env;
 
+pub mod arena;
 mod brain;
 mod evolution;
 mod genotype;
@@ -26,6 +27,10 @@ struct SimulationOptions {
     save_every: Option<usize>,
     /// Directory for population snapshots
     snapshot_dir: String,
+    /// Tournament mode: run Elo tournament from a snapshot file
+    tournament: Option<String>,
+    /// Number of rounds per pair in tournament (default: 3)
+    tournament_rounds: usize,
 }
 
 impl Default for SimulationOptions {
@@ -37,6 +42,8 @@ impl Default for SimulationOptions {
             replay: None,
             save_every: None,
             snapshot_dir: "snapshots".to_string(),
+            tournament: None,
+            tournament_rounds: 3,
         }
     }
 }
@@ -76,6 +83,18 @@ fn parse_args() -> SimulationOptions {
                     opts.snapshot_dir = args[i].clone();
                 }
             }
+            "--tournament" | "-t" => {
+                i += 1;
+                if i < args.len() {
+                    opts.tournament = Some(args[i].clone());
+                }
+            }
+            "--tournament-rounds" => {
+                i += 1;
+                if i < args.len() {
+                    opts.tournament_rounds = args[i].parse().unwrap_or(3);
+                }
+            }
             "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
@@ -86,6 +105,8 @@ fn parse_args() -> SimulationOptions {
                 println!("  --replay, -r FILE   Load and watch saved creatures (default: creatures.json)");
                 println!("  --save-every N      Save population snapshot every N generations");
                 println!("  --snapshot-dir DIR  Directory for snapshots (default: snapshots/)");
+                println!("  --tournament, -t F  Run Elo tournament from snapshot file");
+                println!("  --tournament-rounds N  Rounds per pair in tournament (default: 3)");
                 println!("  --help, -h          Show this help message");
                 println!();
                 println!("Examples:");
@@ -93,6 +114,7 @@ fn parse_args() -> SimulationOptions {
                 println!("  cargo run -- --headless --speed 10           # Fast evolution");
                 println!("  cargo run -- --headless --save-every 5       # Snapshot every 5 gens");
                 println!("  cargo run -- --replay                       # Watch saved creatures");
+                println!("  cargo run -- --tournament snapshots/gen_0010.json  # Run tournament");
                 std::process::exit(0);
             }
             _ => {}
@@ -106,12 +128,118 @@ fn parse_args() -> SimulationOptions {
 fn main() {
     let opts = parse_args();
 
-    if let Some(ref path) = opts.replay {
+    if let Some(ref path) = opts.tournament {
+        run_tournament(path.clone(), opts.tournament_rounds);
+    } else if let Some(ref path) = opts.replay {
         run_replay(opts.clone(), path.clone());
     } else if opts.headless {
         run_headless(opts);
     } else {
         run_with_graphics(opts);
+    }
+}
+
+/// Run an Elo tournament from a saved population snapshot.
+///
+/// This is a pure-computation mode — no physics sim needed.
+/// It uses each creature's existing fitness score as their performance
+/// metric and runs a round-robin tournament to compute Elo ratings
+/// and Balduzzi's transitive-cyclic decomposition.
+fn run_tournament(snapshot_path: String, rounds_per_pair: usize) {
+    use arena::{CriterionId, Tournament, TournamentConfig};
+    use std::collections::HashMap;
+
+    // Load the snapshot
+    let snapshot = match genotype::PopulationSnapshot::load(&snapshot_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error loading snapshot '{}': {}", snapshot_path, e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("=== Elo Tournament ===");
+    println!("Snapshot: {} (generation {})", snapshot_path, snapshot.generation);
+    println!("Creatures: {}", snapshot.individuals.len());
+    println!("Rounds per pair: {}", rounds_per_pair);
+    println!();
+
+    // Build score map from fitness values
+    let scores: HashMap<u64, f32> = snapshot
+        .individuals
+        .iter()
+        .map(|ind| (ind.id, ind.fitness))
+        .collect();
+
+    let config = TournamentConfig {
+        rounds_per_pair,
+        criterion: CriterionId::LocomotionDistance,
+        ..Default::default()
+    };
+
+    let results = Tournament::run_from_scores(config, &scores);
+
+    // Print leaderboard
+    println!("--- Leaderboard ---");
+    for (rank, (id, rating)) in results.leaderboard().iter().enumerate() {
+        let fitness = scores.get(id).unwrap_or(&0.0);
+        println!(
+            "  #{:<3} Creature {:>4}  Elo: {:>7.1}  Fitness: {:.3}",
+            rank + 1,
+            id,
+            rating,
+            fitness,
+        );
+    }
+    println!();
+
+    // Print decomposition
+    if let Some(ref decomp) = results.decomposition {
+        println!("--- Transitive-Cyclic Decomposition (Balduzzi et al.) ---");
+        println!("  Cycle strength: {:.3} (0=fully transitive, 1=fully cyclic)", decomp.cycle_strength);
+
+        if decomp.cycle_strength > 0.3 {
+            println!("  ** Significant intransitive dynamics detected! **");
+            println!("  This means creatures have specialized into niches that");
+            println!("  exploit each other's weaknesses (rock-paper-scissors).");
+        }
+
+        println!();
+        println!("  Cycle participation (how much each creature is involved in cycles):");
+        let mut participants: Vec<_> = results
+            .participants
+            .iter()
+            .zip(decomp.cycle_participation.iter())
+            .collect();
+        participants.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, participation) in participants.iter().take(10) {
+            println!("    Creature {:>4}: {:.3}", id, participation);
+        }
+
+        if !decomp.detected_cycles.is_empty() {
+            println!();
+            println!("  Detected intransitive cycles:");
+            for (i, cycle) in decomp.detected_cycles.iter().take(5).enumerate() {
+                let ids: Vec<_> = cycle
+                    .iter()
+                    .map(|&idx| results.participants[idx])
+                    .collect();
+                println!("    Cycle {}: {:?}", i + 1, ids);
+            }
+        }
+    }
+
+    // Save results
+    let output_path = format!(
+        "{}.tournament.json",
+        snapshot_path.trim_end_matches(".json")
+    );
+    match serde_json::to_string_pretty(&results) {
+        Ok(json) => match std::fs::write(&output_path, json) {
+            Ok(_) => println!("\nResults saved to {}", output_path),
+            Err(e) => eprintln!("\nWarning: Failed to save results: {}", e),
+        },
+        Err(e) => eprintln!("\nWarning: Failed to serialize results: {}", e),
     }
 }
 
