@@ -22,6 +22,10 @@ struct SimulationOptions {
     verbose: bool,
     /// Replay mode: load and watch saved creatures
     replay: Option<String>,
+    /// Save population snapshot every N generations
+    save_every: Option<usize>,
+    /// Directory for population snapshots
+    snapshot_dir: String,
 }
 
 impl Default for SimulationOptions {
@@ -31,6 +35,8 @@ impl Default for SimulationOptions {
             speed: 1.0,
             verbose: true,
             replay: None,
+            save_every: None,
+            snapshot_dir: "snapshots".to_string(),
         }
     }
 }
@@ -58,20 +64,35 @@ fn parse_args() -> SimulationOptions {
                     opts.replay = Some("creatures.json".to_string());
                 }
             }
+            "--save-every" => {
+                i += 1;
+                if i < args.len() {
+                    opts.save_every = Some(args[i].parse().unwrap_or(5));
+                }
+            }
+            "--snapshot-dir" => {
+                i += 1;
+                if i < args.len() {
+                    opts.snapshot_dir = args[i].clone();
+                }
+            }
             "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
                 println!("Options:");
-                println!("  --headless        Run without graphics (faster evolution)");
-                println!("  --speed, -s N     Simulation speed multiplier (default: 1.0)");
-                println!("  --quiet, -q       Reduce output verbosity");
-                println!("  --replay, -r FILE Load and watch saved creatures (default: creatures.json)");
-                println!("  --help, -h        Show this help message");
+                println!("  --headless          Run without graphics (faster evolution)");
+                println!("  --speed, -s N       Simulation speed multiplier (default: 1.0)");
+                println!("  --quiet, -q         Reduce output verbosity");
+                println!("  --replay, -r FILE   Load and watch saved creatures (default: creatures.json)");
+                println!("  --save-every N      Save population snapshot every N generations");
+                println!("  --snapshot-dir DIR  Directory for snapshots (default: snapshots/)");
+                println!("  --help, -h          Show this help message");
                 println!();
                 println!("Examples:");
-                println!("  cargo run                          # Run with graphics");
-                println!("  cargo run -- --headless --speed 10 # Fast evolution");
-                println!("  cargo run -- --replay              # Watch saved creatures");
+                println!("  cargo run                                    # Run with graphics");
+                println!("  cargo run -- --headless --speed 10           # Fast evolution");
+                println!("  cargo run -- --headless --save-every 5       # Snapshot every 5 gens");
+                println!("  cargo run -- --replay                       # Watch saved creatures");
                 std::process::exit(0);
             }
             _ => {}
@@ -333,6 +354,7 @@ fn setup_with_graphics(
     mut materials: ResMut<Assets<StandardMaterial>>,
     config: Res<EvolutionConfig>,
     mut state: ResMut<EvolutionState>,
+    opts: Res<SimulationOptions>,
 ) {
     // Camera
     commands.spawn((
@@ -359,8 +381,12 @@ fn setup_with_graphics(
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
+    // Configure snapshot settings
+    state.snapshot_interval = opts.save_every;
+    state.snapshot_dir = Some(opts.snapshot_dir.clone());
+
     // Initialize population
-    state.population = init_population(&config);
+    state.population = init_population(&config, &mut state);
     println!("Initialized population with {} individuals", state.population.len());
 }
 
@@ -368,6 +394,7 @@ fn setup_headless(
     mut commands: Commands,
     config: Res<EvolutionConfig>,
     mut state: ResMut<EvolutionState>,
+    opts: Res<SimulationOptions>,
 ) {
     // Ground plane - just collider, no mesh - belongs to GROUP_2, collides with GROUP_1 (creature parts)
     commands.spawn((
@@ -376,8 +403,12 @@ fn setup_headless(
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
+    // Configure snapshot settings
+    state.snapshot_interval = opts.save_every;
+    state.snapshot_dir = Some(opts.snapshot_dir.clone());
+
     // Initialize population
-    state.population = init_population(&config);
+    state.population = init_population(&config, &mut state);
     println!("Initialized population with {} individuals", state.population.len());
 
     // Tracker resource
