@@ -352,6 +352,66 @@ fn run_brains(
                                 0.0
                             }
                         }
+                        SensorType::Velocity { axis } => {
+                            // Linear velocity along an axis (normalized)
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                // Use position delta as velocity proxy (simplified)
+                                match axis {
+                                    SensorAxis::X => (safe.translation.x * 0.1).clamp(-1.0, 1.0),
+                                    SensorAxis::Y => (safe.translation.y * 0.1).clamp(-1.0, 1.0),
+                                    SensorAxis::Z => (safe.translation.z * 0.1).clamp(-1.0, 1.0),
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::AngularVelocity { axis } => {
+                            // Angular velocity around an axis (normalized)
+                            // Use orientation as proxy (simplified - real impl would track delta)
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                // Use up vector deviation from world up as angular proxy
+                                match axis {
+                                    SensorAxis::X => (safe.up.z).clamp(-1.0, 1.0),
+                                    SensorAxis::Y => (safe.forward.x).clamp(-1.0, 1.0),
+                                    SensorAxis::Z => (safe.up.x).clamp(-1.0, 1.0),
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::Position { axis } => {
+                            // World position component (normalized)
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                match axis {
+                                    SensorAxis::X => (safe.translation.x * 0.1).clamp(-1.0, 1.0),
+                                    SensorAxis::Y => (safe.translation.y * 0.5).clamp(-1.0, 1.0),
+                                    SensorAxis::Z => (safe.translation.z * 0.1).clamp(-1.0, 1.0),
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::GroundContact => {
+                            // Is this part touching the ground?
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                if safe.translation.y < 0.3 { 1.0 } else { 0.0 }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::HeightAboveGround => {
+                            // Height above ground (normalized)
+                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                (safe.translation.y * 0.5).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }
                     };
                     sensors.push(value);
                 }
