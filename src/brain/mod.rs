@@ -243,7 +243,7 @@ fn get_input_value(
 fn run_brains(
     time: Res<Time>,
     mut brains: Query<(Entity, &mut Brain, &CreatureBody)>,
-    mut parts_query: Query<(&CreaturePart, &mut ImpulseJoint, &GlobalTransform)>,
+    mut parts_query: Query<(&CreaturePart, &mut ImpulseJoint, &GlobalTransform, &Velocity)>,
 ) {
     let dt = time.delta_secs();
 
@@ -255,7 +255,7 @@ fn run_brains(
         let mut part_joints: HashMap<(usize, usize), Entity> = HashMap::new();
 
         for &part_entity in &body.parts {
-            if let Ok((part, _, _)) = parts_query.get(part_entity) {
+            if let Ok((part, _, _, _)) = parts_query.get(part_entity) {
                 if part.creature_id == creature_entity {
                     let key = (part.node_id.0, part.instance);
                     part_joints.insert(key, part_entity);
@@ -287,7 +287,7 @@ fn run_brains(
                             // Return joint motor velocity for the specified DOF
                             // In a full implementation, we'd track actual joint angles
                             // For now, use position-based approximation from transform
-                            if let Ok((_, joint, transform)) = parts_query.get(part_entity) {
+                            if let Ok((_, joint, transform, _)) = parts_query.get(part_entity) {
                                 let axis = match dof {
                                     0 => JointAxis::AngX,
                                     1 => JointAxis::AngY,
@@ -317,7 +317,7 @@ fn run_brains(
                         SensorType::Contact { face } => {
                             // Contact sensing based on face direction
                             // Use simplified ground contact detection
-                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                            if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
                                 let safe = SafeTransform::from_global(transform);
                                 // Check if face is pointing downward and close to ground
                                 let face_normal = match face {
@@ -341,13 +341,72 @@ fn run_brains(
                         SensorType::PhotoSensor { axis } => {
                             // Simplified photosensor: detect light direction
                             // Returns how much the specified axis points toward light (up)
-                            if let Ok((_, _, transform)) = parts_query.get(part_entity) {
+                            if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
                                 let safe = SafeTransform::from_global(transform);
                                 match axis {
                                     SensorAxis::X => safe.up.x,
                                     SensorAxis::Y => safe.up.y,
                                     SensorAxis::Z => safe.up.z,
                                 }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::Velocity { axis } => {
+                            // Linear velocity along an axis (from Rapier physics)
+                            if let Ok((_, _, _, velocity)) = parts_query.get(part_entity) {
+                                let v = velocity.linvel;
+                                let raw = match axis {
+                                    SensorAxis::X => v.x,
+                                    SensorAxis::Y => v.y,
+                                    SensorAxis::Z => v.z,
+                                };
+                                sanitize(raw * 0.1).clamp(-1.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::AngularVelocity { axis } => {
+                            // Angular velocity around an axis (from Rapier physics)
+                            if let Ok((_, _, _, velocity)) = parts_query.get(part_entity) {
+                                let av = velocity.angvel;
+                                let raw = match axis {
+                                    SensorAxis::X => av.x,
+                                    SensorAxis::Y => av.y,
+                                    SensorAxis::Z => av.z,
+                                };
+                                sanitize(raw * 0.1).clamp(-1.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::Position { axis } => {
+                            // World position component (normalized)
+                            if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                match axis {
+                                    SensorAxis::X => (safe.translation.x * 0.1).clamp(-1.0, 1.0),
+                                    SensorAxis::Y => (safe.translation.y * 0.5).clamp(-1.0, 1.0),
+                                    SensorAxis::Z => (safe.translation.z * 0.1).clamp(-1.0, 1.0),
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::GroundContact => {
+                            // Is this part touching the ground?
+                            if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                if safe.translation.y < 0.3 { 1.0 } else { 0.0 }
+                            } else {
+                                0.0
+                            }
+                        }
+                        SensorType::HeightAboveGround => {
+                            // Height above ground (normalized)
+                            if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
+                                let safe = SafeTransform::from_global(transform);
+                                (safe.translation.y * 0.5).clamp(0.0, 1.0)
                             } else {
                                 0.0
                             }
@@ -406,7 +465,7 @@ fn run_brains(
         for (&part_key, &part_entity) in &part_joints {
             let node_id = NodeId(part_key.0);
             if let Some(node) = brain.genotype.morphology.get_node(node_id) {
-                if let Ok((_, mut joint, _)) = parts_query.get_mut(part_entity) {
+                if let Ok((_, mut joint, _, _)) = parts_query.get_mut(part_entity) {
                     for effector in &node.neural.effectors {
                         // Get effector input value
                         let value = get_input_value(

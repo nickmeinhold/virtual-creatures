@@ -6,15 +6,25 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Sensor types that provide input signals
+/// Sensor types that provide input signals (based on Karl Sims' original sensors)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SensorType {
-    /// Current angle of a joint degree of freedom
+    /// Current angle of a joint degree of freedom (radians, normalized to roughly [-1, 1])
     JointAngle { dof: usize },
-    /// Contact sensor for a face of the part (activates on collision)
+    /// Contact sensor for a face of the part (1.0 if touching, 0.0 otherwise)
     Contact { face: Face },
-    /// Photosensor - reacts to light source direction
+    /// Photosensor - how much the specified axis points toward light (up)
     PhotoSensor { axis: SensorAxis },
+    /// Linear velocity of this part along an axis (normalized)
+    Velocity { axis: SensorAxis },
+    /// Angular velocity of this part around an axis (normalized)
+    AngularVelocity { axis: SensorAxis },
+    /// World position component (useful for height sensing)
+    Position { axis: SensorAxis },
+    /// Is this part currently in contact with the ground? (1.0 = yes, 0.0 = no)
+    GroundContact,
+    /// Current height above ground (normalized, 0 = ground, 1 = high up)
+    HeightAboveGround,
 }
 
 /// Which face of a box-shaped part

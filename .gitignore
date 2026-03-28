@@ -1,2 +1,4 @@
 /target
 creatures.json
+.DS_Store
+firebase-debug.log

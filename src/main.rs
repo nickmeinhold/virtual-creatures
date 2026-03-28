@@ -405,6 +405,7 @@ fn evolution_system(
     mut state: ResMut<EvolutionState>,
     mut tracker: ResMut<CreatureTracker>,
     opts: Res<SimulationOptions>,
+    keyboard: Res<ButtonInput<KeyCode>>,
     creatures: Query<Entity, With<TestCreature>>,
     creature_parts: Query<(&CreaturePart, &Transform)>,
 ) {
@@ -485,9 +486,10 @@ fn evolution_system(
             }
         }
 
-        // Check if test duration elapsed
+        // Check if test duration elapsed or space pressed to skip
         let elapsed = current_time - state.test_start_time;
-        if elapsed >= config.test_duration {
+        let skip_pressed = keyboard.just_pressed(KeyCode::Space);
+        if elapsed >= config.test_duration || skip_pressed {
             // Calculate fitness
             let fitness = calculate_fitness(
                 state.test_start_position,
