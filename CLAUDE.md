@@ -78,14 +78,15 @@ Edit `EvolutionConfig` in `src/evolution/mod.rs`:
 ```rust
 EvolutionConfig {
     population_size: 20,
-    survival_ratio: 0.2,      // Top 20% survive
     asexual_prob: 0.4,
     crossover_prob: 0.3,
-    grafting_prob: 0.3,
     mutation_rate: 0.3,
     test_duration: 10.0,      // Seconds per creature
 }
 ```
+
+Speciation is configured separately via `SpeciationConfig` (compatibility threshold, stagnation limit, etc.).
+
 
 ## Common Issues
 

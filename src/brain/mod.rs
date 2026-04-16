@@ -354,6 +354,8 @@ fn run_brains(
                         }
                         SensorType::Velocity { axis } => {
                             // Linear velocity along an axis (from Rapier physics)
+                            // Scale: 10 m/s maps to ±1.0 sensor output
+                            const VELOCITY_SCALE: f32 = 1.0 / 10.0;
                             if let Ok((_, _, _, velocity)) = parts_query.get(part_entity) {
                                 let v = velocity.linvel;
                                 let raw = match axis {
@@ -361,13 +363,15 @@ fn run_brains(
                                     SensorAxis::Y => v.y,
                                     SensorAxis::Z => v.z,
                                 };
-                                sanitize(raw * 0.1).clamp(-1.0, 1.0)
+                                sanitize(raw * VELOCITY_SCALE).clamp(-1.0, 1.0)
                             } else {
                                 0.0
                             }
                         }
                         SensorType::AngularVelocity { axis } => {
                             // Angular velocity around an axis (from Rapier physics)
+                            // Scale: 10 rad/s maps to ±1.0 sensor output
+                            const ANGULAR_VEL_SCALE: f32 = 1.0 / 10.0;
                             if let Ok((_, _, _, velocity)) = parts_query.get(part_entity) {
                                 let av = velocity.angvel;
                                 let raw = match axis {
@@ -375,19 +379,22 @@ fn run_brains(
                                     SensorAxis::Y => av.y,
                                     SensorAxis::Z => av.z,
                                 };
-                                sanitize(raw * 0.1).clamp(-1.0, 1.0)
+                                sanitize(raw * ANGULAR_VEL_SCALE).clamp(-1.0, 1.0)
                             } else {
                                 0.0
                             }
                         }
                         SensorType::Position { axis } => {
                             // World position component (normalized)
+                            // Horizontal: 10m maps to ±1.0; Vertical: 2m maps to ±1.0
+                            const HORIZONTAL_POS_SCALE: f32 = 1.0 / 10.0;
+                            const VERTICAL_POS_SCALE: f32 = 1.0 / 2.0;
                             if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
                                 let safe = SafeTransform::from_global(transform);
                                 match axis {
-                                    SensorAxis::X => (safe.translation.x * 0.1).clamp(-1.0, 1.0),
-                                    SensorAxis::Y => (safe.translation.y * 0.5).clamp(-1.0, 1.0),
-                                    SensorAxis::Z => (safe.translation.z * 0.1).clamp(-1.0, 1.0),
+                                    SensorAxis::X => (safe.translation.x * HORIZONTAL_POS_SCALE).clamp(-1.0, 1.0),
+                                    SensorAxis::Y => (safe.translation.y * VERTICAL_POS_SCALE).clamp(-1.0, 1.0),
+                                    SensorAxis::Z => (safe.translation.z * HORIZONTAL_POS_SCALE).clamp(-1.0, 1.0),
                                 }
                             } else {
                                 0.0
@@ -395,18 +402,22 @@ fn run_brains(
                         }
                         SensorType::GroundContact => {
                             // Is this part touching the ground?
+                            // Threshold: parts below 0.3m are considered grounded
+                            const GROUND_CONTACT_THRESHOLD: f32 = 0.3;
                             if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
                                 let safe = SafeTransform::from_global(transform);
-                                if safe.translation.y < 0.3 { 1.0 } else { 0.0 }
+                                if safe.translation.y < GROUND_CONTACT_THRESHOLD { 1.0 } else { 0.0 }
                             } else {
                                 0.0
                             }
                         }
                         SensorType::HeightAboveGround => {
                             // Height above ground (normalized)
+                            // 2m maps to 1.0 sensor output
+                            const HEIGHT_SCALE: f32 = 1.0 / 2.0;
                             if let Ok((_, _, transform, _)) = parts_query.get(part_entity) {
                                 let safe = SafeTransform::from_global(transform);
-                                (safe.translation.y * 0.5).clamp(0.0, 1.0)
+                                (safe.translation.y * HEIGHT_SCALE).clamp(0.0, 1.0)
                             } else {
                                 0.0
                             }
@@ -486,12 +497,12 @@ fn run_brains(
 
                         // Set motor velocity based on effector output
                         // Sanitize and clamp to prevent physics instability
-                        let motor_velocity = sanitize(value * 5.0).clamp(-50.0, 50.0);
-                        let max_force = sanitize(effector.max_force).clamp(0.0, 10000.0);
+                        let motor_velocity = sanitize(value * 5.0).clamp(-10.0, 10.0);
+                        let max_force = sanitize(effector.max_force).clamp(0.0, 1000.0);
                         let raw = joint.data.as_mut();
-                        // Use set_motor with high stiffness to actively drive the joint
-                        // target_pos=0, target_vel=motor_velocity, stiffness=0, damping=max_force
-                        raw.set_motor(axis, 0.0, motor_velocity, 0.0, max_force);
+                        // Drive the joint with stiffness (active force toward target velocity)
+                        // and moderate damping (prevents overshoot/oscillation)
+                        raw.set_motor(axis, 0.0, motor_velocity, max_force, max_force * 0.1);
                     }
                 }
             }
