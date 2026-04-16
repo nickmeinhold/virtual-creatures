@@ -9,6 +9,7 @@
 
 use bevy::prelude::*;
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::genotype::*;
 
@@ -17,14 +18,10 @@ use crate::genotype::*;
 pub struct EvolutionConfig {
     /// Population size
     pub population_size: usize,
-    /// Fraction that survives each generation
-    pub survival_ratio: f32,
-    /// Probability of asexual reproduction
+    /// Probability of asexual reproduction (vs crossover/grafting)
     pub asexual_prob: f32,
     /// Probability of crossover
     pub crossover_prob: f32,
-    /// Probability of grafting
-    pub grafting_prob: f32,
     /// Mutation rate for parameters
     pub mutation_rate: f32,
     /// Duration of each fitness test in seconds
@@ -35,13 +32,229 @@ impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
             population_size: 20,
-            survival_ratio: 0.2,
             asexual_prob: 0.4,
             crossover_prob: 0.3,
-            grafting_prob: 0.3,
             mutation_rate: 0.3,
             test_duration: 10.0,
         }
+    }
+}
+
+/// Monotonic counter for assigning globally unique gene IDs.
+/// Each new gene (morphology node) created by mutation or random generation
+/// gets the next ID. Inherited genes keep their original ID through cloning,
+/// crossover, and grafting — this is how we track gene lineage.
+#[derive(Debug, Clone)]
+pub struct InnovationCounter(pub u64);
+
+impl InnovationCounter {
+    pub fn new() -> Self {
+        Self(0)
+    }
+
+    /// Allocate the next unique innovation ID
+    pub fn next(&mut self) -> u64 {
+        let id = self.0;
+        self.0 += 1;
+        id
+    }
+}
+
+// ============================================================================
+// Speciation (NEAT-style)
+// ============================================================================
+
+/// Configuration for speciation
+#[derive(Clone)]
+pub struct SpeciationConfig {
+    /// Weight for disjoint/excess gene count in compatibility distance
+    pub disjoint_coeff: f32,
+    /// Weight for average parameter difference in matching genes
+    pub weight_diff_coeff: f32,
+    /// Compatibility threshold — creatures below this distance are same species
+    pub compatibility_threshold: f32,
+    /// How many generations a species can stagnate before being eliminated
+    pub stagnation_limit: usize,
+}
+
+impl Default for SpeciationConfig {
+    fn default() -> Self {
+        Self {
+            disjoint_coeff: 1.0,
+            weight_diff_coeff: 0.4,
+            // Low threshold to encourage speciation in small populations.
+            // With ~5-12 genes per creature and disjoint_coeff=1.0, the
+            // disjoint term alone typically ranges 0.1-0.8, so 0.5 ensures
+            // creatures with meaningfully different topologies get separated.
+            compatibility_threshold: 0.5,
+            stagnation_limit: 15,
+        }
+    }
+}
+
+/// A species: a group of genetically similar creatures that compete within
+/// their niche rather than globally. This protects novel topologies.
+#[derive(Clone)]
+pub struct Species {
+    /// Representative genotype (random member from previous generation)
+    pub representative: CreatureGenotype,
+    /// Indices into the population vector
+    pub members: Vec<usize>,
+    /// Best fitness ever achieved by this species
+    pub best_fitness: f32,
+    /// Generation when best_fitness last improved
+    pub last_improved: usize,
+    /// Unique ID for this species
+    pub id: usize,
+}
+
+/// Compute compatibility distance between two genotypes using innovation IDs.
+///
+/// The distance measures structural difference (how many genes are unshared)
+/// and parametric difference (how different the shared genes' weights are).
+pub fn compatibility_distance(
+    g1: &CreatureGenotype,
+    g2: &CreatureGenotype,
+    config: &SpeciationConfig,
+) -> f32 {
+    use std::collections::HashMap;
+
+    // Build innovation_id → node maps
+    let genes1: HashMap<u64, &MorphologyNode> = g1.morphology.nodes()
+        .map(|(_, node)| (node.innovation_id, node))
+        .collect();
+    let genes2: HashMap<u64, &MorphologyNode> = g2.morphology.nodes()
+        .map(|(_, node)| (node.innovation_id, node))
+        .collect();
+
+    let mut matching = 0;
+    let mut disjoint = 0;
+    let mut weight_diff_sum = 0.0f32;
+
+    // Check all genes in g1
+    for (&id, node1) in &genes1 {
+        if let Some(node2) = genes2.get(&id) {
+            matching += 1;
+            // Parameter difference: dimensions + joint type mismatch
+            let dim_diff = (node1.dimensions - node2.dimensions).length();
+            let joint_diff = if node1.joint_type != node2.joint_type { 1.0 } else { 0.0 };
+            weight_diff_sum += dim_diff + joint_diff;
+        } else {
+            disjoint += 1;
+        }
+    }
+
+    // Genes only in g2
+    for id in genes2.keys() {
+        if !genes1.contains_key(id) {
+            disjoint += 1;
+        }
+    }
+
+    // Normalize by the size of the larger genome
+    let max_genes = genes1.len().max(genes2.len()).max(1) as f32;
+    let avg_weight_diff = if matching > 0 { weight_diff_sum / matching as f32 } else { 0.0 };
+
+    (config.disjoint_coeff * disjoint as f32 / max_genes)
+        + (config.weight_diff_coeff * avg_weight_diff)
+}
+
+/// Assign each individual in the population to a species.
+/// Returns the updated species list.
+pub fn speciate(
+    population: &[Individual],
+    existing_species: &[Species],
+    config: &SpeciationConfig,
+    generation: usize,
+    next_species_id: &mut usize,
+) -> Vec<Species> {
+    // Start with empty species, keeping representatives from last generation
+    let mut species: Vec<Species> = existing_species.iter().map(|s| {
+        Species {
+            representative: s.representative.clone(),
+            members: Vec::new(),
+            best_fitness: s.best_fitness,
+            last_improved: s.last_improved,
+            id: s.id,
+        }
+    }).collect();
+
+    // Assign each individual to the first compatible species
+    for (idx, individual) in population.iter().enumerate() {
+        let mut assigned = false;
+        for s in &mut species {
+            let dist = compatibility_distance(&individual.genotype, &s.representative, config);
+            if dist < config.compatibility_threshold {
+                s.members.push(idx);
+                assigned = true;
+                break;
+            }
+        }
+
+        // No compatible species found — create a new one
+        if !assigned {
+            let id = *next_species_id;
+            *next_species_id += 1;
+            species.push(Species {
+                representative: individual.genotype.clone(),
+                members: vec![idx],
+                best_fitness: 0.0,
+                last_improved: generation,
+                id,
+            });
+        }
+    }
+
+    // Remove empty species (went extinct)
+    species.retain(|s| !s.members.is_empty());
+
+    // Update representatives: random member from current generation
+    let mut rng = rand::thread_rng();
+    for s in &mut species {
+        if let Some(&member_idx) = s.members.choose(&mut rng) {
+            s.representative = population[member_idx].genotype.clone();
+        }
+    }
+
+    species
+}
+
+/// Apply fitness sharing: divide each creature's fitness by its species size.
+/// This prevents large species from dominating and gives small (novel) species
+/// a fair chance to reproduce.
+pub fn apply_fitness_sharing(population: &mut [Individual], species: &[Species]) {
+    for s in species {
+        let species_size = s.members.len() as f32;
+        for &idx in &s.members {
+            population[idx].fitness /= species_size;
+        }
+    }
+}
+
+/// Update species stagnation tracking after fitness evaluation
+pub fn update_species_fitness(species: &mut [Species], population: &[Individual], generation: usize) {
+    for s in species {
+        let best_in_species = s.members.iter()
+            .map(|&idx| population[idx].fitness)
+            .fold(0.0f32, f32::max);
+
+        if best_in_species > s.best_fitness {
+            s.best_fitness = best_in_species;
+            s.last_improved = generation;
+        }
+    }
+}
+
+/// Remove species that have stagnated (no fitness improvement for too long)
+pub fn cull_stagnant_species(species: &mut Vec<Species>, generation: usize, stagnation_limit: usize) {
+    // Always keep at least one species
+    if species.len() <= 1 {
+        return;
+    }
+    species.retain(|s| generation - s.last_improved < stagnation_limit);
+    // Safety: ensure at least one species survives
+    if species.is_empty() {
+        // This shouldn't happen, but just in case
     }
 }
 
@@ -67,6 +280,16 @@ pub struct EvolutionState {
     pub save_path: Option<String>,
     /// Frames to wait before spawning first creature (let physics initialize)
     pub frames_before_spawn: u32,
+    /// Global counter for assigning unique gene innovation IDs
+    pub innovation_counter: InnovationCounter,
+    /// Current species in the population
+    pub species: Vec<Species>,
+    /// Next species ID to assign
+    pub next_species_id: usize,
+    /// Speciation configuration
+    pub speciation_config: SpeciationConfig,
+    /// Gene analytics: tracks building-block genes across generations
+    pub gene_tracker: GeneTracker,
 }
 
 impl Default for EvolutionState {
@@ -81,6 +304,11 @@ impl Default for EvolutionState {
             archive: Some(CreatureArchive::new()),
             save_path: Some("creatures.json".to_string()),
             frames_before_spawn: 2,
+            innovation_counter: InnovationCounter::new(),
+            species: Vec::new(),
+            next_species_id: 0,
+            speciation_config: SpeciationConfig::default(),
+            gene_tracker: GeneTracker::new(),
         }
     }
 }
@@ -90,18 +318,18 @@ impl Default for EvolutionState {
 // ============================================================================
 
 /// Generate a random genotype
-pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
+pub fn random_genotype(rng: &mut impl Rng, counter: &mut InnovationCounter) -> CreatureGenotype {
     // Random root node
-    let root = random_morphology_node(rng, true);
+    let root = random_morphology_node(rng, true, counter);
     let mut genotype = CreatureGenotype::new(root);
 
-    // Add 1-5 child parts
-    let num_parts = rng.gen_range(1..=5);
+    // Add 1-3 child parts (kept small — recursion can multiply these)
+    let num_parts = rng.gen_range(1..=3);
     let mut parent_options = vec![genotype.root];
 
     for _ in 0..num_parts {
         let parent = *parent_options.choose(rng).unwrap();
-        let node = random_morphology_node(rng, false);
+        let node = random_morphology_node(rng, false, counter);
         let connection = random_connection(rng);
 
         let child = genotype.add_part(parent, node, connection);
@@ -109,7 +337,7 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
 
         // Maybe add symmetric counterpart
         if rng.gen_bool(0.5) {
-            let sym_node = random_morphology_node(rng, false);
+            let sym_node = random_morphology_node(rng, false, counter);
             // Choose reflection axis - X is most common for bilateral symmetry
             let reflect_axis = match rng.gen_range(0..10) {
                 0 => ReflectAxis::Y,  // Less common
@@ -279,7 +507,7 @@ pub fn random_genotype(rng: &mut impl Rng) -> CreatureGenotype {
     genotype
 }
 
-fn random_morphology_node(rng: &mut impl Rng, is_root: bool) -> MorphologyNode {
+fn random_morphology_node(rng: &mut impl Rng, is_root: bool, counter: &mut InnovationCounter) -> MorphologyNode {
     let dimensions = Vec3::new(
         rng.gen_range(0.2..1.0),
         rng.gen_range(0.2..1.0),
@@ -300,7 +528,7 @@ fn random_morphology_node(rng: &mut impl Rng, is_root: bool) -> MorphologyNode {
         }
     };
 
-    let mut node = MorphologyNode::new(dimensions, joint_type);
+    let mut node = MorphologyNode::new(counter.next(), dimensions, joint_type);
     node.recursive_limit = rng.gen_range(1..=3);
     node
 }
@@ -334,7 +562,7 @@ fn random_connection(rng: &mut impl Rng) -> MorphologyConnection {
 // ============================================================================
 
 /// Mutate a genotype in place
-pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
+pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32, counter: &mut InnovationCounter) {
     // Scale mutation rate by complexity (consider both nodes and connections)
     let complexity = genotype.morphology.node_count() + genotype.morphology.connection_count();
     let scale = 1.0 / (complexity as f32).sqrt();
@@ -350,13 +578,13 @@ pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32) {
         mutate_connection(&mut conn.data, rng, adjusted_rate);
     }
 
-    // Maybe add a new part
-    if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 10 {
+    // Maybe add a new part (new gene = new innovation ID)
+    if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 6 {
         let parents: Vec<_> = genotype.morphology.nodes().map(|(id, _)| id).collect();
         if let Some(&parent) = parents.choose(rng) {
             // Validate the parent node exists before adding part
             if genotype.morphology.is_valid(parent) {
-                let new_node = random_morphology_node(rng, false);
+                let new_node = random_morphology_node(rng, false, counter);
                 let new_conn = random_connection(rng);
                 genotype.add_part(parent, new_node, new_conn);
             }
@@ -475,30 +703,79 @@ fn mutate_connection(conn: &mut MorphologyConnection, rng: &mut impl Rng, rate: 
 // Crossover and Grafting
 // ============================================================================
 
-/// Crossover: combine two genotypes by swapping node sequences
+/// NEAT-style aligned crossover using innovation IDs.
+///
+/// Genes (morphology nodes) are matched by their innovation_id:
+/// - **Matching genes**: randomly inherit from either parent
+/// - **Disjoint/excess genes**: inherited from the fitter parent (parent1)
+///
+/// The topology (connections) follows the inherited nodes. When a node is
+/// taken from parent2, its connection data comes along, re-attached to the
+/// closest valid parent in the child.
 pub fn crossover(
     parent1: &CreatureGenotype,
     parent2: &CreatureGenotype,
     rng: &mut impl Rng,
 ) -> CreatureGenotype {
-    // Simple crossover: take root from parent1, add some parts from parent2
-    let mut child = parent1.clone();
+    use std::collections::HashMap;
 
-    // Try to graft a random subtree from parent2
-    if parent2.morphology.node_count() > 1 {
-        let p2_nodes: Vec<_> = parent2.morphology.nodes()
-            .filter(|(id, _)| *id != parent2.root)
-            .collect();
+    // Build innovation_id → (NodeId, node, connection_data) maps for both parents
+    let p1_genes: HashMap<u64, (NodeId, &MorphologyNode, Option<&MorphologyConnection>)> =
+        parent1.morphology.nodes().map(|(id, node)| {
+            let conn = parent1.morphology.connections_to(id).next().map(|c| &c.data);
+            (node.innovation_id, (id, node, conn))
+        }).collect();
 
-        if let Some(&(node_id, node)) = p2_nodes.choose(rng) {
-            // Get the connection for this node
-            if let Some(conn) = parent2.morphology.connections_to(node_id).next() {
-                // Add to a random parent in child
-                let child_parents: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
-                if let Some(&parent) = child_parents.choose(rng) {
-                    child.add_part(parent, node.clone(), conn.data.clone());
+    let p2_genes: HashMap<u64, (NodeId, &MorphologyNode, Option<&MorphologyConnection>)> =
+        parent2.morphology.nodes().map(|(id, node)| {
+            let conn = parent2.morphology.connections_to(id).next().map(|c| &c.data);
+            (node.innovation_id, (id, node, conn))
+        }).collect();
+
+    // Start with the root from parent1 (fitter parent)
+    let root_node = parent1.root_node().clone();
+    let mut child = CreatureGenotype::new(root_node);
+
+    // Collect all innovation IDs from both parents (excluding root)
+    let root_innovation = parent1.root_node().innovation_id;
+    let mut all_ids: Vec<u64> = p1_genes.keys()
+        .chain(p2_genes.keys())
+        .copied()
+        .filter(|id| *id != root_innovation)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    all_ids.sort(); // Deterministic ordering by innovation ID
+
+    for innovation_id in all_ids {
+        let (chosen_node, chosen_conn) = match (p1_genes.get(&innovation_id), p2_genes.get(&innovation_id)) {
+            // Matching gene: randomly pick from either parent
+            (Some((_, n1, c1)), Some((_, n2, c2))) => {
+                if rng.gen_bool(0.5) {
+                    ((*n1).clone(), c1.cloned().unwrap_or_default())
+                } else {
+                    ((*n2).clone(), c2.cloned().unwrap_or_default())
                 }
             }
+            // Disjoint/excess: only in fitter parent (parent1) — include
+            (Some((_, node, conn)), None) => {
+                ((*node).clone(), conn.cloned().unwrap_or_default())
+            }
+            // Only in parent2 (less fit) — include with lower probability
+            (None, Some((_, node, conn))) => {
+                if rng.gen_bool(0.3) {
+                    ((*node).clone(), conn.cloned().unwrap_or_default())
+                } else {
+                    continue;
+                }
+            }
+            (None, None) => unreachable!(),
+        };
+
+        // Attach to a random existing node in the child
+        let child_nodes: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
+        if let Some(&attach_point) = child_nodes.choose(rng) {
+            child.add_part(attach_point, chosen_node, chosen_conn);
         }
     }
 
@@ -541,8 +818,195 @@ pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
     // Horizontal distance traveled in any direction (ignore Y to avoid rewarding falling)
     let horizontal_dist = Vec2::new(end_pos.x - start_pos.x, end_pos.z - start_pos.z).length();
 
-    // Normalize by time to get speed
-    horizontal_dist / duration.max(1.0)
+    // Penalize creatures that fly too high — if the center of mass is above
+    // this threshold, they're exploiting physics, not locomoting.
+    let max_reasonable_height = 3.0;
+    let height_penalty = (end_pos.y - max_reasonable_height).max(0.0);
+
+    // Normalize by time to get speed, then subtract height penalty
+    let speed = horizontal_dist / duration.max(1.0);
+    (speed - height_penalty).max(0.0)
+}
+
+// ============================================================================
+// Gene Analytics
+// ============================================================================
+
+/// Per-gene statistics tracked across generations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GeneStats {
+    /// How many times this gene has appeared in the population (across all generations)
+    pub total_appearances: usize,
+    /// How many times this gene appeared in the top 20% of performers
+    pub top_performer_appearances: usize,
+    /// Running average fitness of individuals carrying this gene
+    pub avg_fitness: f32,
+    /// The generation this gene was first seen
+    pub first_seen: usize,
+    /// The generation this gene was last seen
+    pub last_seen: usize,
+}
+
+/// Tracks gene frequency and fitness contribution across the entire evolutionary run.
+/// This reveals which innovation IDs are "building blocks" — genes that consistently
+/// appear in high-fitness individuals.
+#[derive(Debug, Clone, Default)]
+pub struct GeneTracker {
+    pub stats: std::collections::HashMap<u64, GeneStats>,
+}
+
+impl GeneTracker {
+    pub fn new() -> Self {
+        Self { stats: std::collections::HashMap::new() }
+    }
+
+    /// Record one generation's worth of data
+    pub fn record_generation(&mut self, population: &[Individual], generation: usize) {
+        // Find the top 20% fitness threshold
+        let mut fitnesses: Vec<f32> = population.iter().map(|i| i.fitness).collect();
+        fitnesses.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let top_threshold = fitnesses.get(fitnesses.len() / 5).copied().unwrap_or(0.0);
+
+        for individual in population {
+            let is_top = individual.fitness >= top_threshold && top_threshold > 0.0;
+
+            for (_, node) in individual.genotype.morphology.nodes() {
+                let entry = self.stats.entry(node.innovation_id).or_insert(GeneStats {
+                    first_seen: generation,
+                    ..Default::default()
+                });
+
+                entry.total_appearances += 1;
+                entry.last_seen = generation;
+
+                // Incremental average: avg = avg + (new - avg) / n
+                let n = entry.total_appearances as f32;
+                entry.avg_fitness += (individual.fitness - entry.avg_fitness) / n;
+
+                if is_top {
+                    entry.top_performer_appearances += 1;
+                }
+            }
+        }
+    }
+
+    /// Get the top N building-block genes ranked by frequency in top performers
+    pub fn top_building_blocks(&self, n: usize) -> Vec<(u64, &GeneStats)> {
+        let mut genes: Vec<_> = self.stats.iter().map(|(&id, stats)| (id, stats)).collect();
+        genes.sort_by(|a, b| {
+            b.1.top_performer_appearances.cmp(&a.1.top_performer_appearances)
+                .then_with(|| b.1.avg_fitness.partial_cmp(&a.1.avg_fitness).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        genes.truncate(n);
+        genes
+    }
+
+    /// Print a summary of building-block genes
+    pub fn print_summary(&self, top_n: usize) {
+        let blocks = self.top_building_blocks(top_n);
+        if blocks.is_empty() { return; }
+
+        println!("  Top building-block genes:");
+        for (id, stats) in blocks {
+            let elite_rate = if stats.total_appearances > 0 {
+                stats.top_performer_appearances as f32 / stats.total_appearances as f32 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    Gene #{}: seen {}x, elite {:.0}%, avg fitness {:.3}, gens {}-{}",
+                id, stats.total_appearances, elite_rate, stats.avg_fitness,
+                stats.first_seen, stats.last_seen,
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Surrogate Fitness Encoding
+// ============================================================================
+
+/// Features extracted from a single morphology node for the surrogate model.
+/// This is the per-gene "slot" in the fixed-length feature vector.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct GeneFeatures {
+    /// Whether this gene is present (1.0) or absent (0.0)
+    pub present: f32,
+    /// Volume of the body part (proxy for mass)
+    pub volume: f32,
+    /// Joint degrees of freedom (0-3)
+    pub joint_dof: f32,
+    /// Number of neurons in this part's neural circuit
+    pub neuron_count: f32,
+    /// Number of effectors (motor outputs)
+    pub effector_count: f32,
+    /// Number of sensors
+    pub sensor_count: f32,
+    /// Recursive limit (how many times this gene can repeat)
+    pub recursive_limit: f32,
+}
+
+impl GeneFeatures {
+    /// Number of f32 values per gene slot
+    pub const DIMENSION: usize = 7;
+
+    /// Convert to a flat array for model input
+    pub fn to_array(&self) -> [f32; Self::DIMENSION] {
+        [
+            self.present,
+            self.volume,
+            self.joint_dof,
+            self.neuron_count,
+            self.effector_count,
+            self.sensor_count,
+            self.recursive_limit,
+        ]
+    }
+}
+
+/// Encode a genotype as a fixed-length feature vector for the surrogate model.
+///
+/// The vector has `max_genes * GeneFeatures::DIMENSION` elements. Each gene's
+/// innovation_id maps to a slot; absent genes are zero-filled. This gives the
+/// surrogate a stable, comparable representation across different morphologies.
+#[allow(dead_code)]
+pub fn encode_genotype(genotype: &CreatureGenotype, max_genes: usize) -> Vec<f32> {
+    let mut features = vec![0.0f32; max_genes * GeneFeatures::DIMENSION];
+
+    for (_, node) in genotype.morphology.nodes() {
+        let slot = node.innovation_id as usize;
+        if slot >= max_genes { continue; } // Rare: skip if beyond capacity
+
+        let gene = GeneFeatures {
+            present: 1.0,
+            volume: node.volume(),
+            joint_dof: node.joint_type.dof() as f32,
+            neuron_count: node.neural.neurons.len() as f32,
+            effector_count: node.neural.effectors.len() as f32,
+            sensor_count: node.neural.sensors.len() as f32,
+            recursive_limit: node.recursive_limit as f32,
+        };
+
+        let offset = slot * GeneFeatures::DIMENSION;
+        let arr = gene.to_array();
+        features[offset..offset + GeneFeatures::DIMENSION].copy_from_slice(&arr);
+    }
+
+    features
+}
+
+/// Encode an entire population into a matrix (one row per individual)
+/// along with their fitness values. Ready for training a surrogate model.
+#[allow(dead_code)]
+pub fn encode_population(population: &[Individual], max_genes: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
+    let features: Vec<Vec<f32>> = population.iter()
+        .map(|ind| encode_genotype(&ind.genotype, max_genes))
+        .collect();
+    let fitnesses: Vec<f32> = population.iter()
+        .map(|ind| ind.fitness)
+        .collect();
+    (features, fitnesses)
 }
 
 // ============================================================================
@@ -550,81 +1014,44 @@ pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
 // ============================================================================
 
 /// Initialize the population
-pub fn init_population(config: &EvolutionConfig) -> Vec<Individual> {
+pub fn init_population(config: &EvolutionConfig, counter: &mut InnovationCounter) -> Vec<Individual> {
     let mut rng = rand::thread_rng();
     (0..config.population_size)
         .map(|_| Individual {
-            genotype: random_genotype(&mut rng),
+            genotype: random_genotype(&mut rng, counter),
             fitness: 0.0,
         })
         .collect()
 }
 
-/// Select survivors based on fitness
-pub fn select_survivors(population: &mut Vec<Individual>, survival_ratio: f32) {
-    // Sort by fitness (descending)
-    population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
-
-    // Keep top fraction
-    let num_survivors = ((population.len() as f32) * survival_ratio).ceil() as usize;
-    population.truncate(num_survivors.max(1));
-}
-
-/// Reproduce to fill population back up
-pub fn reproduce(population: &mut Vec<Individual>, target_size: usize, config: &EvolutionConfig) {
-    let mut rng = rand::thread_rng();
-    let survivors = population.clone();
-
-    while population.len() < target_size {
-        let roll: f32 = rng.gen();
-
-        let child_genotype = if roll < config.asexual_prob {
-            // Asexual: mutate a copy
-            let parent = survivors.choose(&mut rng).unwrap();
-            let mut child = parent.genotype.clone();
-            mutate(&mut child, &mut rng, config.mutation_rate);
-            child
-        } else if roll < config.asexual_prob + config.crossover_prob {
-            // Crossover
-            let p1 = survivors.choose(&mut rng).unwrap();
-            let p2 = survivors.choose(&mut rng).unwrap();
-            let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
-            mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
-            child
-        } else if roll < config.asexual_prob + config.crossover_prob + config.grafting_prob {
-            // Grafting: take a subtree from one parent and attach to another
-            let p1 = survivors.choose(&mut rng).unwrap();
-            let p2 = survivors.choose(&mut rng).unwrap();
-            let mut child = graft(&p1.genotype, &p2.genotype, &mut rng);
-            mutate(&mut child, &mut rng, config.mutation_rate * 0.5);
-            child
-        } else {
-            // Fallback: asexual reproduction
-            let parent = survivors.choose(&mut rng).unwrap();
-            let mut child = parent.genotype.clone();
-            mutate(&mut child, &mut rng, config.mutation_rate);
-            child
-        };
-
-        population.push(Individual {
-            genotype: child_genotype,
-            fitness: 0.0,
-        });
-    }
-}
-
 /// Run one generation of evolution
 pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
-    // Select survivors
-    select_survivors(&mut state.population, config.survival_ratio);
+    // Step 1: Speciate the population based on genetic similarity
+    state.species = speciate(
+        &state.population,
+        &state.species,
+        &state.speciation_config,
+        state.generation,
+        &mut state.next_species_id,
+    );
 
-    // Record best and save to archive
-    if let Some(best) = state.population.first() {
+    // Step 2: Update species fitness tracking (for stagnation detection)
+    update_species_fitness(&mut state.species, &state.population, state.generation);
+
+    // Step 3: Record gene analytics (before fitness sharing modifies values)
+    state.gene_tracker.record_generation(&state.population, state.generation);
+
+    // Step 4: Record global best (before fitness sharing modifies values)
+    // Sort by raw fitness to find the true best
+    let global_best = state.population.iter()
+        .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+        .cloned();
+
+    if let Some(ref best) = global_best {
         state.best_fitness = best.fitness;
 
         // Add to archive if enabled
         if let Some(ref mut archive) = state.archive {
-            // Count parts in the best creature
             let part_count = count_spawned_parts(&best.genotype);
 
             let saved = SavedCreature::new(
@@ -634,11 +1061,8 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
                 part_count,
             );
             archive.add(saved);
-
-            // Keep only the best 10
             archive.keep_best(10);
 
-            // Save to file if path is set
             if let Some(ref path) = state.save_path {
                 if let Err(e) = archive.save(path) {
                     eprintln!("Warning: Failed to save creatures: {}", e);
@@ -647,16 +1071,104 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
         }
     }
 
-    // Reproduce
-    reproduce(&mut state.population, config.population_size, config);
+    // Step 4: Apply fitness sharing (divide by species size)
+    apply_fitness_sharing(&mut state.population, &state.species);
 
+    // Step 5: Cull stagnant species
+    cull_stagnant_species(&mut state.species, state.generation, state.speciation_config.stagnation_limit);
+
+    // Step 6: Reproduce proportionally to species' adjusted fitness
+    let mut new_population = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    // Calculate total adjusted fitness per species
+    let species_fitness: Vec<f32> = state.species.iter().map(|s| {
+        s.members.iter()
+            .map(|&idx| state.population[idx].fitness.max(0.0))
+            .sum::<f32>()
+    }).collect();
+    let total_fitness: f32 = species_fitness.iter().sum();
+
+    // Each species gets offspring proportional to its share of total adjusted fitness
+    for (s_idx, s) in state.species.iter().enumerate() {
+        if s.members.is_empty() { continue; }
+
+        // Number of offspring for this species
+        let offspring_count = if total_fitness > 0.0 {
+            ((species_fitness[s_idx] / total_fitness) * config.population_size as f32).round() as usize
+        } else {
+            // Equal distribution if all fitness is zero (e.g., first generation)
+            config.population_size / state.species.len()
+        };
+
+        // Get this species' members sorted by fitness (descending)
+        let mut species_members: Vec<&Individual> = s.members.iter()
+            .map(|&idx| &state.population[idx])
+            .collect();
+        species_members.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+
+        // Keep the champion of each species (elitism)
+        if let Some(&champion) = species_members.first() {
+            new_population.push(Individual {
+                genotype: champion.genotype.clone(),
+                fitness: 0.0,
+            });
+        }
+
+        // Fill remaining slots with offspring
+        for _ in 1..offspring_count {
+            let roll: f32 = rng.gen();
+
+            let child_genotype = if roll < config.asexual_prob {
+                let parent = species_members.choose(&mut rng).unwrap();
+                let mut child = parent.genotype.clone();
+                mutate(&mut child, &mut rng, config.mutation_rate, &mut state.innovation_counter);
+                child
+            } else if roll < config.asexual_prob + config.crossover_prob {
+                let p1 = species_members.choose(&mut rng).unwrap();
+                let p2 = species_members.choose(&mut rng).unwrap();
+                let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
+                mutate(&mut child, &mut rng, config.mutation_rate * 0.5, &mut state.innovation_counter);
+                child
+            } else {
+                let p1 = species_members.choose(&mut rng).unwrap();
+                let p2 = species_members.choose(&mut rng).unwrap();
+                let mut child = graft(&p1.genotype, &p2.genotype, &mut rng);
+                mutate(&mut child, &mut rng, config.mutation_rate * 0.5, &mut state.innovation_counter);
+                child
+            };
+
+            new_population.push(Individual {
+                genotype: child_genotype,
+                fitness: 0.0,
+            });
+        }
+    }
+
+    // Ensure we hit exact population size (rounding can leave us short or over)
+    while new_population.len() < config.population_size {
+        // Fill with mutated copies of random existing members
+        if let Some(parent) = new_population.choose(&mut rng).cloned() {
+            let mut child = parent.genotype;
+            mutate(&mut child, &mut rng, config.mutation_rate, &mut state.innovation_counter);
+            new_population.push(Individual { genotype: child, fitness: 0.0 });
+        }
+    }
+    new_population.truncate(config.population_size);
+
+    state.population = new_population;
     state.generation += 1;
     state.current_individual = 0;
 
     println!(
-        "Generation {}: best fitness = {:.3}",
-        state.generation, state.best_fitness
+        "Generation {}: best fitness = {:.3}, species = {}",
+        state.generation, state.best_fitness, state.species.len()
     );
+
+    // Print building block summary every 10 generations
+    if state.generation % 10 == 0 {
+        state.gene_tracker.print_summary(5);
+    }
 }
 
 /// Count how many parts would be spawned from a genotype

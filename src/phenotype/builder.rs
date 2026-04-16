@@ -153,7 +153,8 @@ impl PhenotypeBuilder {
         depth: usize,
     ) {
         const MAX_DEPTH: usize = 10; // prevent infinite recursion
-        if depth >= MAX_DEPTH {
+        const MAX_PARTS: usize = 8;
+        if depth >= MAX_DEPTH || state.spawned_parts.len() >= MAX_PARTS {
             return;
         }
 

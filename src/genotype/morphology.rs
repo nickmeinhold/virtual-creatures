@@ -52,9 +52,18 @@ pub struct JointLimits {
 }
 
 impl JointLimits {
+    /// Default biologically-inspired joint limits per DOF.
+    /// First DOF is the primary bend axis (widest range),
+    /// subsequent DOFs are progressively more restricted (twist, lateral).
     pub fn new(dof: usize) -> Self {
+        use std::f32::consts::FRAC_PI_2;
+        let limits = (0..dof).map(|d| match d {
+            0 => (-FRAC_PI_2 * 1.5, FRAC_PI_2 * 1.5), // ±135° primary bend (like a knee/elbow)
+            1 => (-FRAC_PI_2, FRAC_PI_2),                // ±90° secondary axis (like shoulder abduction)
+            _ => (-FRAC_PI_2 * 0.5, FRAC_PI_2 * 0.5),   // ±45° twist (like forearm rotation)
+        }).collect();
         Self {
-            limits: vec![(-std::f32::consts::PI, std::f32::consts::PI); dof],
+            limits,
             stiffness: 100.0,
         }
     }
@@ -63,6 +72,11 @@ impl JointLimits {
 /// A body part node in the morphology graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MorphologyNode {
+    /// Globally unique ID tracking this gene's lineage across generations.
+    /// Assigned by an InnovationCounter when the gene first appears; inherited
+    /// unchanged through cloning, crossover, and grafting. Enables NEAT-style
+    /// aligned crossover and stable feature-vector encoding for surrogate models.
+    pub innovation_id: u64,
     /// Dimensions of the box-shaped part
     pub dimensions: Vec3,
     /// Type of joint connecting this part to its parent
@@ -76,9 +90,10 @@ pub struct MorphologyNode {
 }
 
 impl MorphologyNode {
-    pub fn new(dimensions: Vec3, joint_type: JointType) -> Self {
+    pub fn new(innovation_id: u64, dimensions: Vec3, joint_type: JointType) -> Self {
         let dof = joint_type.dof();
         Self {
+            innovation_id,
             dimensions,
             joint_type,
             joint_limits: JointLimits::new(dof),

@@ -486,12 +486,12 @@ fn run_brains(
 
                         // Set motor velocity based on effector output
                         // Sanitize and clamp to prevent physics instability
-                        let motor_velocity = sanitize(value * 5.0).clamp(-50.0, 50.0);
-                        let max_force = sanitize(effector.max_force).clamp(0.0, 10000.0);
+                        let motor_velocity = sanitize(value * 5.0).clamp(-10.0, 10.0);
+                        let max_force = sanitize(effector.max_force).clamp(0.0, 1000.0);
                         let raw = joint.data.as_mut();
-                        // Use set_motor with high stiffness to actively drive the joint
-                        // target_pos=0, target_vel=motor_velocity, stiffness=0, damping=max_force
-                        raw.set_motor(axis, 0.0, motor_velocity, 0.0, max_force);
+                        // Drive the joint with stiffness (active force toward target velocity)
+                        // and moderate damping (prevents overshoot/oscillation)
+                        raw.set_motor(axis, 0.0, motor_velocity, max_force, max_force * 0.1);
                     }
                 }
             }

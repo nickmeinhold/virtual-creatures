@@ -360,7 +360,7 @@ fn setup_with_graphics(
     ));
 
     // Initialize population
-    state.population = init_population(&config);
+    state.population = init_population(&config, &mut state.innovation_counter);
     println!("Initialized population with {} individuals", state.population.len());
 }
 
@@ -377,7 +377,7 @@ fn setup_headless(
     ));
 
     // Initialize population
-    state.population = init_population(&config);
+    state.population = init_population(&config, &mut state.innovation_counter);
     println!("Initialized population with {} individuals", state.population.len());
 
     // Tracker resource
@@ -719,7 +719,8 @@ fn spawn_children_headless(
     depth: usize,
 ) {
     const MAX_DEPTH: usize = 10;
-    if depth >= MAX_DEPTH {
+    const MAX_PARTS: usize = 8;
+    if depth >= MAX_DEPTH || state.spawned_parts.len() >= MAX_PARTS {
         return;
     }
 
