@@ -87,6 +87,7 @@ EvolutionConfig {
 
 Speciation is configured separately via `SpeciationConfig` (compatibility threshold, stagnation limit, etc.).
 
+
 ## Common Issues
 
 - **NaN/Inf in physics**: Check `SafeTransform` in `brain/mod.rs`
