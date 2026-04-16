@@ -75,6 +75,10 @@ pub struct SpeciationConfig {
     pub compatibility_threshold: f32,
     /// How many generations a species can stagnate before being eliminated
     pub stagnation_limit: usize,
+    /// Probability of inheriting disjoint genes from the less-fit parent
+    /// during crossover. Higher = more genetic diversity, lower = more
+    /// conservative (only proven genes survive). 0.0-1.0.
+    pub disjoint_inherit_prob: f64,
 }
 
 impl Default for SpeciationConfig {
@@ -88,6 +92,7 @@ impl Default for SpeciationConfig {
             // creatures with meaningfully different topologies get separated.
             compatibility_threshold: 0.5,
             stagnation_limit: 15,
+            disjoint_inherit_prob: 0.3,
         }
     }
 }
@@ -723,28 +728,34 @@ pub fn crossover(
     parent1: &CreatureGenotype,
     parent2: &CreatureGenotype,
     rng: &mut impl Rng,
+    speciation_config: &SpeciationConfig,
 ) -> CreatureGenotype {
     use std::collections::HashMap;
 
-    // Build innovation_id → (NodeId, node, connection_data) maps for both parents
-    let p1_genes: HashMap<u64, (NodeId, &MorphologyNode, Option<&MorphologyConnection>)> =
-        parent1.morphology.nodes().map(|(id, node)| {
-            let conn = parent1.morphology.connections_to(id).next().map(|c| &c.data);
-            (node.innovation_id, (id, node, conn))
-        }).collect();
+    // Build innovation_id → (NodeId, node, connection_data, parent_innovation_id) maps.
+    // The parent_innovation_id lets us preserve topology when assembling the child.
+    fn build_gene_map(genotype: &CreatureGenotype) -> HashMap<u64, (NodeId, MorphologyNode, MorphologyConnection, Option<u64>)> {
+        genotype.morphology.nodes().map(|(id, node)| {
+            let conn = genotype.morphology.connections_to(id).next();
+            let parent_innovation = conn.map(|c| genotype.morphology[c.from].innovation_id);
+            let conn_data = conn.map(|c| c.data.clone()).unwrap_or_default();
+            (node.innovation_id, (id, node.clone(), conn_data, parent_innovation))
+        }).collect()
+    }
 
-    let p2_genes: HashMap<u64, (NodeId, &MorphologyNode, Option<&MorphologyConnection>)> =
-        parent2.morphology.nodes().map(|(id, node)| {
-            let conn = parent2.morphology.connections_to(id).next().map(|c| &c.data);
-            (node.innovation_id, (id, node, conn))
-        }).collect();
+    let p1_genes = build_gene_map(parent1);
+    let p2_genes = build_gene_map(parent2);
 
     // Start with the root from parent1 (fitter parent)
     let root_node = parent1.root_node().clone();
     let mut child = CreatureGenotype::new(root_node);
 
-    // Collect all innovation IDs from both parents (excluding root)
+    // Track which innovation IDs are in the child and their NodeId
     let root_innovation = parent1.root_node().innovation_id;
+    let mut child_innovation_to_node: HashMap<u64, NodeId> = HashMap::new();
+    child_innovation_to_node.insert(root_innovation, child.root);
+
+    // Collect all innovation IDs from both parents (excluding root)
     let mut all_ids: Vec<u64> = p1_genes.keys()
         .chain(p2_genes.keys())
         .copied()
@@ -755,23 +766,24 @@ pub fn crossover(
     all_ids.sort(); // Deterministic ordering by innovation ID
 
     for innovation_id in all_ids {
-        let (chosen_node, chosen_conn) = match (p1_genes.get(&innovation_id), p2_genes.get(&innovation_id)) {
+        // Decide which parent to take the gene from, and get its source info
+        let (chosen_node, chosen_conn, parent_innov) = match (p1_genes.get(&innovation_id), p2_genes.get(&innovation_id)) {
             // Matching gene: randomly pick from either parent
-            (Some((_, n1, c1)), Some((_, n2, c2))) => {
+            (Some((_, n1, c1, pi1)), Some((_, n2, c2, pi2))) => {
                 if rng.gen_bool(0.5) {
-                    ((*n1).clone(), c1.cloned().unwrap_or_default())
+                    (n1.clone(), c1.clone(), *pi1)
                 } else {
-                    ((*n2).clone(), c2.cloned().unwrap_or_default())
+                    (n2.clone(), c2.clone(), *pi2)
                 }
             }
             // Disjoint/excess: only in fitter parent (parent1) — include
-            (Some((_, node, conn)), None) => {
-                ((*node).clone(), conn.cloned().unwrap_or_default())
+            (Some((_, node, conn, pi)), None) => {
+                (node.clone(), conn.clone(), *pi)
             }
-            // Only in parent2 (less fit) — include with lower probability
-            (None, Some((_, node, conn))) => {
-                if rng.gen_bool(0.3) {
-                    ((*node).clone(), conn.cloned().unwrap_or_default())
+            // Only in parent2 (less fit) — include with configurable probability
+            (None, Some((_, node, conn, pi))) => {
+                if rng.gen_bool(speciation_config.disjoint_inherit_prob) {
+                    (node.clone(), conn.clone(), *pi)
                 } else {
                     continue;
                 }
@@ -779,11 +791,18 @@ pub fn crossover(
             (None, None) => unreachable!(),
         };
 
-        // Attach to a random existing node in the child
-        let child_nodes: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
-        if let Some(&attach_point) = child_nodes.choose(rng) {
-            child.add_part(attach_point, chosen_node, chosen_conn);
-        }
+        // Topology-preserving attachment: try to attach to the same parent
+        // gene that this node was connected to in its source parent.
+        // Fall back to random attachment if that parent isn't in the child.
+        let attach_point = parent_innov
+            .and_then(|pi| child_innovation_to_node.get(&pi).copied())
+            .unwrap_or_else(|| {
+                let child_nodes: Vec<_> = child.morphology.nodes().map(|(id, _)| id).collect();
+                *child_nodes.choose(rng).unwrap_or(&child.root)
+            });
+
+        let new_node_id = child.add_part(attach_point, chosen_node, chosen_conn);
+        child_innovation_to_node.insert(innovation_id, new_node_id);
     }
 
     child
@@ -974,16 +993,18 @@ impl GeneFeatures {
 
 /// Encode a genotype as a fixed-length feature vector for the surrogate model.
 ///
-/// The vector has `max_genes * GeneFeatures::DIMENSION` elements. Each gene's
-/// innovation_id maps to a slot; absent genes are zero-filled. This gives the
-/// surrogate a stable, comparable representation across different morphologies.
+/// The vector has `counter.0 * GeneFeatures::DIMENSION` elements — one slot per
+/// innovation ID ever issued. Each gene's innovation_id maps to its slot; absent
+/// genes are zero-filled. Using the counter as the dimension guarantees no gene
+/// is silently dropped.
 #[allow(dead_code)]
-pub fn encode_genotype(genotype: &CreatureGenotype, max_genes: usize) -> Vec<f32> {
-    let mut features = vec![0.0f32; max_genes * GeneFeatures::DIMENSION];
+pub fn encode_genotype(genotype: &CreatureGenotype, counter: &InnovationCounter) -> Vec<f32> {
+    let num_slots = (counter.0 as usize).max(1);
+    let mut features = vec![0.0f32; num_slots * GeneFeatures::DIMENSION];
 
     for (_, node) in genotype.morphology.nodes() {
         let slot = node.innovation_id as usize;
-        if slot >= max_genes { continue; } // Rare: skip if beyond capacity
+        if slot >= num_slots { continue; }
 
         let gene = GeneFeatures {
             present: 1.0,
@@ -1005,10 +1026,12 @@ pub fn encode_genotype(genotype: &CreatureGenotype, max_genes: usize) -> Vec<f32
 
 /// Encode an entire population into a matrix (one row per individual)
 /// along with their fitness values. Ready for training a surrogate model.
+/// Uses the innovation counter to determine vector width, ensuring all
+/// genes that have ever existed have a stable slot.
 #[allow(dead_code)]
-pub fn encode_population(population: &[Individual], max_genes: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
+pub fn encode_population(population: &[Individual], counter: &InnovationCounter) -> (Vec<Vec<f32>>, Vec<f32>) {
     let features: Vec<Vec<f32>> = population.iter()
-        .map(|ind| encode_genotype(&ind.genotype, max_genes))
+        .map(|ind| encode_genotype(&ind.genotype, counter))
         .collect();
     let fitnesses: Vec<f32> = population.iter()
         .map(|ind| ind.fitness)
@@ -1135,7 +1158,7 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
             } else if roll < config.asexual_prob + config.crossover_prob {
                 let p1 = species_members.choose(&mut rng).unwrap();
                 let p2 = species_members.choose(&mut rng).unwrap();
-                let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng);
+                let mut child = crossover(&p1.genotype, &p2.genotype, &mut rng, &state.speciation_config);
                 mutate(&mut child, &mut rng, config.mutation_rate * 0.5, &mut state.innovation_counter);
                 child
             } else {
