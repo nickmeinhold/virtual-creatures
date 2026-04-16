@@ -251,10 +251,17 @@ pub fn cull_stagnant_species(species: &mut Vec<Species>, generation: usize, stag
     if species.len() <= 1 {
         return;
     }
+
+    // Sort by best_fitness descending so the best species is first
+    species.sort_by(|a, b| b.best_fitness.partial_cmp(&a.best_fitness).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Cull stagnant species, but always preserve the best one
+    let best = species[0].clone();
     species.retain(|s| generation - s.last_improved < stagnation_limit);
-    // Safety: ensure at least one species survives
+
+    // Ensure at least the best species survives total extinction
     if species.is_empty() {
-        // This shouldn't happen, but just in case
+        species.push(best);
     }
 }
 
@@ -1041,7 +1048,7 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
     // Step 3: Record gene analytics (before fitness sharing modifies values)
     state.gene_tracker.record_generation(&state.population, state.generation);
 
-    // Step 4: Record global best (before fitness sharing modifies values)
+    // Step 3b: Record global best (before fitness sharing modifies values)
     // Sort by raw fitness to find the true best
     let global_best = state.population.iter()
         .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
@@ -1072,6 +1079,7 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
     }
 
     // Step 4: Apply fitness sharing (divide by species size)
+    // This ensures small novel species get a fair share of reproduction.
     apply_fitness_sharing(&mut state.population, &state.species);
 
     // Step 5: Cull stagnant species
