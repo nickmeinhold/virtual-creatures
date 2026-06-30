@@ -192,7 +192,7 @@ struct ExportState {
 }
 
 fn run_export(opts: SimulationOptions, out_path: String) {
-    let archive = match genotype::CreatureArchive::load("creatures.json") {
+    let mut archive = match genotype::CreatureArchive::load("creatures.json") {
         Ok(a) => a,
         Err(e) => {
             eprintln!("Error loading creatures.json: {}", e);
@@ -204,7 +204,12 @@ fn run_export(opts: SimulationOptions, out_path: String) {
         std::process::exit(1);
     }
 
-    let fps = 30;
+    // Export only the strongest distinct lineages — the gallery showcases the
+    // top handful, and this keeps the web payload light.
+    archive.creatures.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+    archive.creatures.truncate(16);
+
+    let fps = 24;
     let n = archive.creatures.len();
     println!("Exporting {} creatures to '{}' ({} fps)...", n, out_path, fps);
 
@@ -315,11 +320,15 @@ fn export_system(
     if local >= state.frames.len() as f32 / state.fps as f32 && state.frames.len() < total_frames {
         let entities = state.part_entities.clone();
         let mut pose = Vec::with_capacity(entities.len());
+        // Quantize to keep the web JSON small: positions to mm, quaternions to
+        // 1e-4. Visually lossless for a card-sized canvas, ~2x smaller on disk.
+        let qpos = |v: f32| (v * 1000.0).round() / 1000.0;
+        let qrot = |v: f32| (v * 10000.0).round() / 10000.0;
         for entity in &entities {
             if let Ok((_, tf)) = parts_q.get(*entity) {
                 let p = tf.translation;
                 let q = tf.rotation;
-                pose.push([p.x, p.y, p.z, q.x, q.y, q.z, q.w]);
+                pose.push([qpos(p.x), qpos(p.y), qpos(p.z), qrot(q.x), qrot(q.y), qrot(q.z), qrot(q.w)]);
             } else {
                 pose.push([0.0; 7]);
             }
