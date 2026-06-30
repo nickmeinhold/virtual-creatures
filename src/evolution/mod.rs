@@ -25,11 +25,26 @@ pub struct Tuning {
     pub struct_boost: f64,
 }
 
+// Parse an env override, warning loudly on a malformed value rather than
+// silently running the default — a typo'd sweep config should not quietly run
+// the wrong experiment.
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match std::env::var(key) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("WARNING: {key}='{v}' is not a valid number; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match std::env::var(key) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("WARNING: {key}='{v}' is not a valid integer; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 pub fn tuning() -> &'static Tuning {

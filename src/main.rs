@@ -131,6 +131,9 @@ fn run_with_graphics(opts: SimulationOptions) {
         .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
+        // Unified fixed timestep across ALL modes: the brain steps SIM_DT per
+        // tick, so physics must too, or the two desync at non-60Hz framerates.
+        .insert_resource(FIXED_TIMESTEP)
         .insert_resource(EvolutionConfig::default())
         .insert_resource(EvolutionState::default())
         .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0), ..default() })
@@ -404,6 +407,8 @@ fn run_replay(opts: SimulationOptions, path: String) {
         .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
+        // Same unified fixed timestep as every other mode (see run_with_graphics).
+        .insert_resource(FIXED_TIMESTEP)
         .insert_resource(replay_state)
         .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0), ..default() })
         .add_systems(Startup, setup_replay)
