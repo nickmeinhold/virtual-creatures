@@ -767,79 +767,133 @@ impl CreatureTracker {
             part_count,
         }
     }
+
+    /// Fold one frame's per-creature aggregates into the telemetry. Shared by the
+    /// single-creature and batched evaluation paths so they measure identically.
+    fn ingest_frame(&mut self, agg: &FrameAgg, elapsed: f32) {
+        if agg.count == 0 {
+            return;
+        }
+        let com = agg.total / agg.count as f32;
+        if agg.max_lin.is_finite() && agg.max_lin > self.max_part_speed {
+            self.max_part_speed = agg.max_lin;
+        }
+        if agg.max_ang.is_finite() && agg.max_ang > self.max_angspeed {
+            self.max_angspeed = agg.max_ang;
+        }
+        if com.is_finite() {
+            self.center = com;
+        }
+        let mean_angspeed = agg.sum_ang / agg.count as f32;
+
+        if !self.settled {
+            // Re-baseline the behaviour peaks the moment the creature settles.
+            if elapsed >= SETTLE_SECS {
+                self.peak_height = com.y;
+                self.settle_com = com.y;
+                self.peak_part_height = agg.max_y;
+                self.min_part_floor = agg.min_y;
+                self.settle_floor = agg.min_y;
+                self.total_spin = 0.0;
+                self.sum_top_height = 0.0;
+                // Reset the cheat guards too, so the spawn-drop landing impact
+                // can't disqualify a creature for a transient. NaN/explosion is
+                // still caught by the is_finite filters every frame.
+                self.max_part_speed = 0.0;
+                self.max_angspeed = 0.0;
+                self.settled = true;
+            }
+            return;
+        }
+        self.peak_height = self.peak_height.max(com.y);
+        self.peak_part_height = self.peak_part_height.max(agg.max_y);
+        self.min_part_floor = self.min_part_floor.max(agg.min_y);
+        if mean_angspeed.is_finite() {
+            self.total_spin += mean_angspeed * SIM_DT;
+        }
+        // Integrate top-part height over time for reach's sustained-height reward.
+        if agg.max_y.is_finite() {
+            self.sum_top_height += agg.max_y * SIM_DT;
+        }
+    }
 }
 
 /// Seconds to let a creature drop and settle before height/spin telemetry
 /// starts — otherwise the spawn fall pollutes every height-based objective.
 const SETTLE_SECS: f32 = 1.0;
 
-/// Fold one frame of part state into the tracker: centre of mass, the linear
-/// and angular cheat-guard peaks (tracked from spawn), and — once settled — the
-/// per-objective behaviour peaks. `elapsed` is seconds since this run's start.
+/// One frame's aggregates over a single creature's parts.
+struct FrameAgg {
+    total: Vec3,
+    count: u32,
+    min_y: f32,
+    max_y: f32,
+    max_lin: f32,
+    max_ang: f32,
+    sum_ang: f32,
+}
+
+impl Default for FrameAgg {
+    fn default() -> Self {
+        Self {
+            total: Vec3::ZERO,
+            count: 0,
+            min_y: f32::INFINITY,
+            max_y: f32::NEG_INFINITY,
+            max_lin: 0.0,
+            max_ang: 0.0,
+            sum_ang: 0.0,
+        }
+    }
+}
+
+impl FrameAgg {
+    fn add(&mut self, tf: &Transform, vel: &Velocity) {
+        self.total += tf.translation;
+        self.count += 1;
+        self.min_y = self.min_y.min(tf.translation.y);
+        self.max_y = self.max_y.max(tf.translation.y);
+        let lin = vel.linvel.length();
+        if lin.is_finite() {
+            self.max_lin = self.max_lin.max(lin);
+        }
+        let ang = vel.angvel.length();
+        if ang.is_finite() {
+            self.max_ang = self.max_ang.max(ang);
+            self.sum_ang += ang;
+        }
+    }
+}
+
+/// Single-creature telemetry: aggregate all parts in the world and fold one frame.
 fn accumulate_telemetry(
     tracker: &mut CreatureTracker,
     parts: &Query<(&CreaturePart, &Transform, &Velocity)>,
     elapsed: f32,
 ) {
-    let mut total_pos = Vec3::ZERO;
-    let mut count = 0u32;
-    let mut frame_min_y = f32::INFINITY;
-    let mut frame_max_y = f32::NEG_INFINITY;
-    let mut sum_angspeed = 0.0;
+    let mut agg = FrameAgg::default();
     for (_, tf, vel) in parts.iter() {
-        total_pos += tf.translation;
-        count += 1;
-        frame_min_y = frame_min_y.min(tf.translation.y);
-        frame_max_y = frame_max_y.max(tf.translation.y);
-        let lin = vel.linvel.length();
-        if lin.is_finite() && lin > tracker.max_part_speed {
-            tracker.max_part_speed = lin;
-        }
-        let ang = vel.angvel.length();
-        if ang.is_finite() && ang > tracker.max_angspeed {
-            tracker.max_angspeed = ang;
-        }
-        sum_angspeed += ang;
+        agg.add(tf, vel);
     }
-    if count == 0 {
-        return;
-    }
-    let com = total_pos / count as f32;
-    if com.is_finite() {
-        tracker.center = com;
-    }
-    let mean_angspeed = sum_angspeed / count as f32;
+    tracker.ingest_frame(&agg, elapsed);
+}
 
-    if !tracker.settled {
-        // Re-baseline the behaviour peaks the moment the creature has settled,
-        // then start accumulating against that baseline.
-        if elapsed >= SETTLE_SECS {
-            tracker.peak_height = com.y;
-            tracker.settle_com = com.y;
-            tracker.peak_part_height = frame_max_y;
-            tracker.min_part_floor = frame_min_y;
-            tracker.settle_floor = frame_min_y;
-            tracker.total_spin = 0.0;
-            tracker.sum_top_height = 0.0;
-            // Reset the cheat guards too, so the spawn-drop landing impact can't
-            // disqualify a creature for a transient it never intended. Real
-            // solver-vibration exploits are sustained and show up post-settle;
-            // NaN/explosion is still caught by the is_finite filters every frame.
-            tracker.max_part_speed = 0.0;
-            tracker.max_angspeed = 0.0;
-            tracker.settled = true;
+/// Batched telemetry: group the world's parts by creature and fold one frame into
+/// each member's tracker. Creatures don't collide with each other, so a batch
+/// evaluated together measures the same as it would alone.
+fn accumulate_batch(
+    members: &mut std::collections::HashMap<Entity, BatchMember>,
+    parts: &Query<(&CreaturePart, &Transform, &Velocity)>,
+    elapsed: f32,
+) {
+    let mut aggs: std::collections::HashMap<Entity, FrameAgg> = std::collections::HashMap::new();
+    for (cp, tf, vel) in parts.iter() {
+        aggs.entry(cp.creature_id).or_default().add(tf, vel);
+    }
+    for (cid, agg) in &aggs {
+        if let Some(m) = members.get_mut(cid) {
+            m.tracker.ingest_frame(agg, elapsed);
         }
-        return;
-    }
-    tracker.peak_height = tracker.peak_height.max(com.y);
-    tracker.peak_part_height = tracker.peak_part_height.max(frame_max_y);
-    tracker.min_part_floor = tracker.min_part_floor.max(frame_min_y);
-    if mean_angspeed.is_finite() {
-        tracker.total_spin += mean_angspeed * SIM_DT;
-    }
-    // Integrate the top-part height over time for reach's sustained-height reward.
-    if frame_max_y.is_finite() {
-        tracker.sum_top_height += frame_max_y * SIM_DT;
     }
 }
 
@@ -848,6 +902,36 @@ fn accumulate_telemetry(
 struct SimulatedTime {
     elapsed: f32,
 }
+
+/// One creature being evaluated as part of a batch.
+struct BatchMember {
+    /// Index into the population this creature's fitness is written back to.
+    pop_index: usize,
+    tracker: CreatureTracker,
+    start_pos: Vec3,
+}
+
+/// Headless batch-evaluation state: several creatures simulated together in one
+/// physics world (they only collide with the ground, never each other), each
+/// tracked independently. This amortises the per-step physics cost across the
+/// whole batch — the dominant speedup for evolution runs.
+#[derive(Resource, Default)]
+struct BatchEval {
+    members: std::collections::HashMap<Entity, BatchMember>,
+    start_time: f32,
+    /// How many individuals the current batch spawned (to advance the cursor).
+    spawned: usize,
+}
+
+/// How many creatures to evaluate together per physics world.
+fn batch_size() -> usize {
+    std::env::var("VC_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1)
+}
+
+/// Horizontal spacing between batched creatures. Telemetry is per-creature so
+/// this isn't needed for correctness, but keeping bodies apart avoids any
+/// solver oddity from perfectly coincident transforms.
+const BATCH_SPACING: f32 = 30.0;
 
 fn setup_with_graphics(
     mut commands: Commands,
@@ -902,8 +986,8 @@ fn setup_headless(
     state.population = init_population(&config, &mut state.innovation_counter);
     println!("Initialized population with {} individuals", state.population.len());
 
-    // Tracker resource
-    commands.insert_resource(CreatureTracker::default());
+    // Per-batch telemetry + the simulated clock.
+    commands.insert_resource(BatchEval::default());
     commands.insert_resource(SimulatedTime::default());
 }
 
@@ -1030,14 +1114,16 @@ fn evolution_system(
     }
 }
 
-/// Headless evolution system - uses simulated time and no meshes
+/// Headless evolution system — evaluates a BATCH of creatures together in one
+/// physics world (they collide only with the ground, never each other), so the
+/// per-step physics cost is shared across the batch. Uses simulated time, no meshes.
 #[allow(clippy::too_many_arguments)]
 fn evolution_system_headless(
     mut commands: Commands,
     sim_time: Res<SimulatedTime>,
     config: Res<EvolutionConfig>,
     mut state: ResMut<EvolutionState>,
-    mut tracker: ResMut<CreatureTracker>,
+    mut batch: ResMut<BatchEval>,
     opts: Res<SimulationOptions>,
     creatures: Query<Entity, With<TestCreature>>,
     creature_parts: Query<(&CreaturePart, &Transform, &Velocity)>,
@@ -1049,79 +1135,71 @@ fn evolution_system_headless(
     }
 
     let current_time = sim_time.elapsed;
+    let has_creatures = !creatures.is_empty();
 
-    // Check if we need to spawn a new creature
-    let has_creature = !creatures.is_empty();
-
-    if !has_creature {
-        // Spawn the current individual
+    if !has_creatures {
+        // Spawn the next batch of individuals.
         if state.current_individual < state.population.len() {
-            let individual = &state.population[state.current_individual];
-            let spawn_pos = Vec3::new(0.0, 2.0, 0.0);
+            batch.members.clear();
+            let base = state.current_individual;
+            let end = (base + batch_size()).min(state.population.len());
+            for slot in 0..(end - base) {
+                let pop_index = base + slot;
+                let genotype = state.population[pop_index].genotype.clone();
+                let spawn_pos = Vec3::new(slot as f32 * BATCH_SPACING, 2.0, 0.0);
 
-            // Get root node info for logging
-            let root = individual.genotype.root_node();
-            let root_dims = root.dimensions;
+                let spawned = spawn_creature_headless(&mut commands, &genotype, spawn_pos);
+                for entity in &spawned.parts {
+                    commands.entity(*entity).insert(TestCreature);
+                }
+                commands.entity(spawned.root).insert(TestCreature);
+                commands.entity(spawned.creature_entity).insert(Brain::new(genotype.clone()));
 
-            // Spawn without meshes for headless mode
-            let spawned = spawn_creature_headless(
-                &mut commands,
-                &individual.genotype,
-                spawn_pos,
-            );
-
-            // Mark all parts as test creature
-            for entity in &spawned.parts {
-                commands.entity(*entity).insert(TestCreature);
+                let mut tracker = CreatureTracker::default();
+                tracker.reset(spawn_pos);
+                batch.members.insert(
+                    spawned.creature_entity,
+                    BatchMember { pop_index, tracker, start_pos: spawn_pos },
+                );
             }
-            commands.entity(spawned.root).insert(TestCreature);
-
-            // Add brain
-            commands.entity(spawned.creature_entity).insert(Brain::new(individual.genotype.clone()));
-
-            let num_parts = spawned.parts.len();
-            let current = state.current_individual + 1;
-            let pop_size = state.population.len();
-            let gen = state.generation;
-
-            state.test_start_time = current_time;
-            state.test_start_position = spawn_pos;
-            tracker.reset(spawn_pos);
+            batch.start_time = current_time;
+            batch.spawned = end - base;
 
             if opts.verbose {
                 println!(
-                    "Testing individual {}/{} (gen {}) - root: {:.2}x{:.2}x{:.2}, {} parts",
-                    current, pop_size, gen,
-                    root_dims.x, root_dims.y, root_dims.z, num_parts
+                    "Testing individuals {}-{}/{} (gen {})",
+                    base + 1, end, state.population.len(), state.generation
                 );
             }
         }
     } else {
-        let elapsed = current_time - state.test_start_time;
-        accumulate_telemetry(&mut tracker, &creature_parts, elapsed);
+        let elapsed = current_time - batch.start_time;
+        accumulate_batch(&mut batch.members, &creature_parts, elapsed);
 
         // Check if test duration elapsed
         if elapsed >= config.test_duration {
-            let fitness = calculate_fitness(
-                &tracker.fitness_inputs(state.test_start_position, config.test_duration, creature_parts.iter().count()),
-            );
-
-            let idx = state.current_individual;
-            state.population[idx].fitness = fitness;
-            if opts.verbose {
-                println!(
-                    "  Individual {} fitness: {:.3} (x={:.2})",
-                    state.current_individual + 1, fitness, tracker.center.x
-                );
+            // Part count per creature (for distance's complexity bonus).
+            let mut part_counts: std::collections::HashMap<Entity, usize> = std::collections::HashMap::new();
+            for (cp, _, _) in creature_parts.iter() {
+                *part_counts.entry(cp.creature_id).or_insert(0) += 1;
             }
 
-            // Despawn current creature
+            for (cid, m) in batch.members.iter() {
+                let parts = part_counts.get(cid).copied().unwrap_or(0);
+                let fitness = calculate_fitness(
+                    &m.tracker.fitness_inputs(m.start_pos, config.test_duration, parts),
+                );
+                state.population[m.pop_index].fitness = fitness;
+            }
+
+            // Despawn the whole batch.
             for entity in creatures.iter() {
                 commands.entity(entity).despawn_recursive();
             }
 
-            // Move to next individual
-            state.current_individual += 1;
+            // Advance past the batch we just evaluated.
+            state.current_individual += batch.spawned;
+            batch.members.clear();
 
             // Check if generation complete
             if state.current_individual >= state.population.len() {
