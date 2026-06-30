@@ -277,6 +277,12 @@ fn run_export(opts: SimulationOptions, out_path: String) {
 /// is deliberate: capture generously, ship lean.
 const CREATURES_PER_GEN: usize = 3;
 
+/// Roughly how many generation "stops" to bake into the gallery per objective.
+/// A long run (e.g. 80 generations) is stride-sampled down to this many evenly
+/// spaced stops (the last generation always kept) so the evolutionary arc still
+/// reads while the web payload stays bounded and the generation list scrollable.
+const GALLERY_GEN_STOPS: usize = 20;
+
 /// Per-generation export: bake every objective's `history-<obj>.json` into one
 /// multi-objective, generation-indexed gallery so the viewer can replay the
 /// full evolutionary arc. A *missing* history file is skipped (that objective
@@ -305,7 +311,17 @@ fn run_export_history(opts: SimulationOptions, out_path: String) {
         };
         let obj_idx = meta.len();
         meta.push((mode.key().to_string(), mode.label().to_string(), mode.unit().to_string()));
-        for snap in history.generations {
+
+        // Stride-sample generations down to ~GALLERY_GEN_STOPS evenly spaced
+        // stops (always keeping the final generation) so a long run stays a
+        // bounded, scrollable arc rather than 80 near-identical neighbours.
+        let all = history.generations;
+        let total = all.len();
+        let stride = (total / GALLERY_GEN_STOPS).max(1);
+        for (i, snap) in all.into_iter().enumerate() {
+            if i % stride != 0 && i != total - 1 {
+                continue;
+            }
             // Bake only the strongest few per generation to bound the web
             // payload — pose frames dominate the file size. History is stored
             // best-first, so a prefix is the top creatures of the generation.
