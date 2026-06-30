@@ -10,8 +10,35 @@
 use bevy::prelude::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use crate::genotype::*;
+
+/// Tunables read once from the environment so we can sweep evolution regimes
+/// without recompiling. Lets a single binary run several configs in parallel.
+pub struct Tuning {
+    /// Hard cap on distinct morphology nodes (part-types). Higher = wilder,
+    /// more complex bodies become reachable.
+    pub max_nodes: usize,
+    /// Multiplier on the structural (add-part) mutation probability. >1 pushes
+    /// against the 1/sqrt(complexity) damping so bodies actually grow.
+    pub struct_boost: f64,
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+pub fn tuning() -> &'static Tuning {
+    static T: OnceLock<Tuning> = OnceLock::new();
+    T.get_or_init(|| Tuning {
+        max_nodes: env_usize("VC_MAXNODES", 6),
+        struct_boost: env_f64("VC_ADDPART", 1.0),
+    })
+}
 
 /// Configuration for evolution
 #[derive(Resource, Clone)]
@@ -34,10 +61,10 @@ impl Default for EvolutionConfig {
             // Larger population sustains many NEAT species at once, which both
             // escapes the slow-shuffle local optimum (more parallel exploration)
             // and fills more gallery slots (one champion is archived per species).
-            population_size: 100,
+            population_size: env_usize("VC_POP", 100),
             asexual_prob: 0.4,
             crossover_prob: 0.3,
-            mutation_rate: 0.3,
+            mutation_rate: env_f64("VC_MUT", 0.3) as f32,
             test_duration: 10.0,
         }
     }
@@ -93,8 +120,8 @@ impl Default for SpeciationConfig {
             // With ~5-12 genes per creature and disjoint_coeff=1.0, the
             // disjoint term alone typically ranges 0.1-0.8, so 0.5 ensures
             // creatures with meaningfully different topologies get separated.
-            compatibility_threshold: 0.5,
-            stagnation_limit: 15,
+            compatibility_threshold: env_f64("VC_COMPAT", 0.5) as f32,
+            stagnation_limit: env_usize("VC_STAGNATION", 15),
             disjoint_inherit_prob: 0.3,
         }
     }
@@ -317,7 +344,8 @@ impl Default for EvolutionState {
             test_start_time: 0.0,
             test_start_position: Vec3::ZERO,
             archive: Some(CreatureArchive::new()),
-            save_path: Some("creatures.json".to_string()),
+            // Env-overridable so parallel sweep runs don't clobber each other.
+            save_path: Some(std::env::var("VC_OUT").unwrap_or_else(|_| "creatures.json".to_string())),
             frames_before_spawn: 2,
             innovation_counter: InnovationCounter::new(),
             species: Vec::new(),
@@ -593,8 +621,11 @@ pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32, co
         mutate_connection(&mut conn.data, rng, adjusted_rate);
     }
 
-    // Maybe add a new part (new gene = new innovation ID)
-    if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 6 {
+    // Maybe add a new part (new gene = new innovation ID). The structural boost
+    // pushes against the 1/sqrt(complexity) damping so bodies can actually grow,
+    // and the node cap is env-tunable to allow wilder morphologies.
+    let add_part_prob = ((adjusted_rate as f64) * 0.2 * tuning().struct_boost).clamp(0.0, 1.0);
+    if rng.gen_bool(add_part_prob) && genotype.morphology.node_count() < tuning().max_nodes {
         let parents: Vec<_> = genotype.morphology.nodes().map(|(id, _)| id).collect();
         if let Some(&parent) = parents.choose(rng) {
             // Validate the parent node exists before adding part
