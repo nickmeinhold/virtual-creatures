@@ -156,7 +156,9 @@ impl Default for EvolutionConfig {
             asexual_prob: 0.4,
             crossover_prob: 0.3,
             mutation_rate: env_f64("VC_MUT", 0.3) as f32,
-            test_duration: 10.0,
+            // 1s settle + 6s scored == the 6s window the gallery actually shows,
+            // so we don't compute seconds we throw away. Env-tunable for sweeps.
+            test_duration: env_f64("VC_TEST_SECS", 7.0) as f32,
         }
     }
 }
