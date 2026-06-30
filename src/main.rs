@@ -210,7 +210,9 @@ fn run_export(opts: SimulationOptions, out_path: String) {
     // Export only the strongest distinct lineages — the gallery showcases the
     // top handful, and this keeps the web payload light.
     archive.creatures.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
-    archive.creatures.truncate(16);
+    // 12 matches the gallery's per-objective showcase count; with four
+    // objectives this keeps the combined web payload reasonable.
+    archive.creatures.truncate(12);
 
     let fps = 24;
     let n = archive.creatures.len();
@@ -233,7 +235,7 @@ fn run_export(opts: SimulationOptions, out_path: String) {
         archive,
         out_path,
         fps,
-        duration: 8.0,
+        duration: 6.0,
         current_index: 0,
         gallery: export::WebGallery::new(fps),
         part_entities: Vec::new(),
