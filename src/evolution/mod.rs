@@ -1021,13 +1021,17 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
             (horizontal / f.duration.max(1.0)).max(0.0)
         }
         FitnessMode::Jump => {
-            // Reward how far the COM rises above its RESTING height — a real hop,
-            // not static tallness. Disqualify absurd launches (solver fling that
-            // slips under the speed cap).
+            // A real jump launches the WHOLE body off the ground. Reward how high
+            // the creature's LOWEST part rises above where it rested — so every
+            // part must leave the ground to score. This rejects the two false
+            // positives a COM-based measure rewarded: (1) post-landing COM wobble
+            // with the feet still planted, and (2) tipping over (which always
+            // keeps one part on the ground, so the min-across-parts stays low).
+            // Disqualify absurd launches (solver fling that slips the speed cap).
             if !f.peak_com_height.is_finite() || f.peak_com_height > 20.0 {
                 return 0.0;
             }
-            (f.peak_com_height - f.settle_com_height).max(0.0)
+            (f.min_part_floor - f.settle_floor).max(0.0)
         }
         FitnessMode::Spin => {
             // Angular solver-explosion guard (now measured post-settle, so the
