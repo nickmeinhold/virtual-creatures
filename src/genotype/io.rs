@@ -17,15 +17,21 @@ pub struct SavedCreature {
     pub generation: usize,
     /// Number of body parts
     pub part_count: usize,
+    /// NEAT species id this creature belongs to (distinct genetic lineage).
+    /// The archive keeps one champion per species so the gallery is diverse
+    /// by construction rather than 10 near-clones of the fastest mover.
+    #[serde(default)]
+    pub species_id: usize,
 }
 
 impl SavedCreature {
-    pub fn new(genotype: CreatureGenotype, fitness: f32, generation: usize, part_count: usize) -> Self {
+    pub fn new(genotype: CreatureGenotype, fitness: f32, generation: usize, part_count: usize, species_id: usize) -> Self {
         Self {
             genotype,
             fitness,
             generation,
             part_count,
+            species_id,
         }
     }
 }
@@ -45,8 +51,22 @@ impl CreatureArchive {
     }
 
     /// Add a creature to the archive
+    #[allow(dead_code)]
     pub fn add(&mut self, creature: SavedCreature) {
         self.creatures.push(creature);
+    }
+
+    /// Insert or update the champion for a species lineage.
+    ///
+    /// Keeps exactly one entry per `species_id`: the highest-fitness creature
+    /// ever seen in that lineage. This is what makes the gallery diverse —
+    /// each entry is a distinct body-plan family, not a clone of the fastest.
+    pub fn upsert_species_champion(&mut self, creature: SavedCreature) {
+        match self.creatures.iter_mut().find(|c| c.species_id == creature.species_id) {
+            Some(existing) if creature.fitness > existing.fitness => *existing = creature,
+            Some(_) => {} // existing champion is stronger; keep it
+            None => self.creatures.push(creature),
+        }
     }
 
     /// Keep only the best N creatures

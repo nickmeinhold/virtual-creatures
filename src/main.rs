@@ -103,7 +103,7 @@ fn run_with_graphics(opts: SimulationOptions) {
         .insert_resource(opts)
         .insert_resource(EvolutionConfig::default())
         .insert_resource(EvolutionState::default())
-        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0) })
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0), ..default() })
         .add_systems(Startup, setup_with_graphics)
         .add_systems(Update, (evolution_system, camera_follow))
         .run();
@@ -188,7 +188,7 @@ fn run_replay(opts: SimulationOptions, path: String) {
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
         .insert_resource(replay_state)
-        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0) })
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0), ..default() })
         .add_systems(Startup, setup_replay)
         .add_systems(Update, (replay_system, camera_follow))
         .run();
@@ -315,10 +315,16 @@ fn replay_system(
 #[derive(Component)]
 struct TestCreature;
 
-/// Resource to track creature's center of mass
+/// Resource to track creature's center of mass and physics-cheat telemetry
 #[derive(Resource, Default)]
 struct CreatureTracker {
     center: Vec3,
+    /// Highest center-of-mass Y reached during the run (catches launchers that
+    /// fly across and land low, which the end-of-run height penalty misses).
+    peak_height: f32,
+    /// Fastest single part speed (linear, m/s) seen during the run. A legit
+    /// gait stays modest; solver-exploit vibration spikes this.
+    max_part_speed: f32,
 }
 
 /// Simulated elapsed time for headless mode
@@ -407,7 +413,7 @@ fn evolution_system(
     opts: Res<SimulationOptions>,
     keyboard: Res<ButtonInput<KeyCode>>,
     creatures: Query<Entity, With<TestCreature>>,
-    creature_parts: Query<(&CreaturePart, &Transform)>,
+    creature_parts: Query<(&CreaturePart, &Transform, &Velocity)>,
 ) {
     // Wait for physics to initialize
     if state.frames_before_spawn > 0 {
@@ -457,6 +463,8 @@ fn evolution_system(
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
             tracker.center = spawn_pos;
+            tracker.peak_height = spawn_pos.y;
+            tracker.max_part_speed = 0.0;
 
             if opts.verbose {
                 println!(
@@ -472,17 +480,24 @@ fn evolution_system(
             }
         }
     } else {
-        // Update center of mass tracking
+        // Update center of mass tracking + physics-cheat telemetry
         let mut total_pos = Vec3::ZERO;
         let mut count = 0;
-        for (_, transform) in creature_parts.iter() {
+        for (_, transform, velocity) in creature_parts.iter() {
             total_pos += transform.translation;
             count += 1;
+            let speed = velocity.linvel.length();
+            if speed.is_finite() && speed > tracker.max_part_speed {
+                tracker.max_part_speed = speed;
+            }
         }
         if count > 0 {
             let new_center = total_pos / count as f32;
             if new_center.is_finite() {
                 tracker.center = new_center;
+                if new_center.y > tracker.peak_height {
+                    tracker.peak_height = new_center.y;
+                }
             }
         }
 
@@ -495,6 +510,8 @@ fn evolution_system(
                 state.test_start_position,
                 tracker.center,
                 config.test_duration,
+                tracker.peak_height,
+                tracker.max_part_speed,
             );
 
             let idx = state.current_individual;
@@ -534,7 +551,7 @@ fn evolution_system_headless(
     mut tracker: ResMut<CreatureTracker>,
     opts: Res<SimulationOptions>,
     creatures: Query<Entity, With<TestCreature>>,
-    creature_parts: Query<(&CreaturePart, &Transform)>,
+    creature_parts: Query<(&CreaturePart, &Transform, &Velocity)>,
 ) {
     // Wait for physics to initialize
     if state.frames_before_spawn > 0 {
@@ -581,6 +598,8 @@ fn evolution_system_headless(
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
             tracker.center = spawn_pos;
+            tracker.peak_height = spawn_pos.y;
+            tracker.max_part_speed = 0.0;
 
             if opts.verbose {
                 println!(
@@ -591,17 +610,24 @@ fn evolution_system_headless(
             }
         }
     } else {
-        // Update center of mass tracking
+        // Update center of mass tracking + physics-cheat telemetry
         let mut total_pos = Vec3::ZERO;
         let mut count = 0;
-        for (_, transform) in creature_parts.iter() {
+        for (_, transform, velocity) in creature_parts.iter() {
             total_pos += transform.translation;
             count += 1;
+            let speed = velocity.linvel.length();
+            if speed.is_finite() && speed > tracker.max_part_speed {
+                tracker.max_part_speed = speed;
+            }
         }
         if count > 0 {
             let new_center = total_pos / count as f32;
             if new_center.is_finite() {
                 tracker.center = new_center;
+                if new_center.y > tracker.peak_height {
+                    tracker.peak_height = new_center.y;
+                }
             }
         }
 
@@ -613,6 +639,8 @@ fn evolution_system_headless(
                 state.test_start_position,
                 tracker.center,
                 config.test_duration,
+                tracker.peak_height,
+                tracker.max_part_speed,
             );
 
             let idx = state.current_individual;
@@ -796,6 +824,9 @@ fn spawn_part_headless(
         Collider::cuboid(dims.x / 2.0, dims.y / 2.0, dims.z / 2.0),
         ColliderMassProperties::Mass(node.volume()),
         CollisionGroups::new(creature_group, ground_group),
+        // Velocity is written back by Rapier each step; we read it to detect
+        // physics-cheat creatures (solver-energy-leak vibration, launches).
+        Velocity::default(),
         CreaturePart {
             creature_id,
             node_id,

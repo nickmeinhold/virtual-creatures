@@ -31,7 +31,10 @@ pub struct EvolutionConfig {
 impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
-            population_size: 20,
+            // Larger population sustains many NEAT species at once, which both
+            // escapes the slow-shuffle local optimum (more parallel exploration)
+            // and fills more gallery slots (one champion is archived per species).
+            population_size: 100,
             asexual_prob: 0.4,
             crossover_prob: 0.3,
             mutation_rate: 0.3,
@@ -840,12 +843,39 @@ pub fn graft(
 // ============================================================================
 
 /// Calculate fitness based on distance traveled
-pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
+pub fn calculate_fitness(
+    start_pos: Vec3,
+    end_pos: Vec3,
+    duration: f32,
+    peak_height: f32,
+    max_part_speed: f32,
+) -> f32 {
+    // --- Physics-cheat disqualifiers -------------------------------------
+    // A creature that exploits the solver (vibration energy-leak, launches)
+    // isn't locomoting — it's a glitch, and a glitch in the gallery looks fake.
+    // Disqualify outright (fitness 0) so it can't out-reproduce honest gaits.
+
+    // 1. Solver-energy-leak / explosion: no legitimate gait whips a body part
+    //    faster than this. Vibration exploits spike well past it.
+    const MAX_PLAUSIBLE_PART_SPEED: f32 = 25.0; // m/s
+    if !max_part_speed.is_finite() || max_part_speed > MAX_PLAUSIBLE_PART_SPEED {
+        return 0.0;
+    }
+
+    // 2. Ballistic launch: anything that flings its center of mass this high
+    //    is a projectile, not a walker — catch it even if it lands low again
+    //    (which the end-of-run height check below would miss).
+    const MAX_PLAUSIBLE_PEAK_HEIGHT: f32 = 5.0; // metres
+    if !peak_height.is_finite() || peak_height > MAX_PLAUSIBLE_PEAK_HEIGHT {
+        return 0.0;
+    }
+
+    // --- Honest locomotion score -----------------------------------------
     // Horizontal distance traveled in any direction (ignore Y to avoid rewarding falling)
     let horizontal_dist = Vec2::new(end_pos.x - start_pos.x, end_pos.z - start_pos.z).length();
 
-    // Penalize creatures that fly too high — if the center of mass is above
-    // this threshold, they're exploiting physics, not locomoting.
+    // Soft penalty for finishing airborne (in case it ends mid-hop just under
+    // the hard cap above).
     let max_reasonable_height = 3.0;
     let height_penalty = (end_pos.y - max_reasonable_height).max(0.0);
 
@@ -1079,24 +1109,44 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
 
     if let Some(ref best) = global_best {
         state.best_fitness = best.fitness;
+    }
 
-        // Add to archive if enabled
-        if let Some(ref mut archive) = state.archive {
-            let part_count = count_spawned_parts(&best.genotype);
+    // Archive the champion of each species — one entry per distinct lineage —
+    // so the saved gallery is behaviorally diverse rather than 10 near-clones
+    // of whatever moves fastest. Read raw fitness here, BEFORE fitness sharing
+    // (below) rescales it.
+    if let Some(ref mut archive) = state.archive {
+        for s in &state.species {
+            // Champion = highest raw-fitness member of this species.
+            let champion = s.members.iter()
+                .map(|&idx| &state.population[idx])
+                .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
 
-            let saved = SavedCreature::new(
-                best.genotype.clone(),
-                best.fitness,
-                state.generation,
-                part_count,
-            );
-            archive.add(saved);
-            archive.keep_best(10);
+            if let Some(champ) = champion {
+                // Only archive lineages that actually do something — keeps
+                // the barely-moving blobs out of the gallery. (Honest gaits
+                // start slow now that physics-cheats are disqualified.)
+                if champ.fitness < 0.04 { continue; }
 
-            if let Some(ref path) = state.save_path {
-                if let Err(e) = archive.save(path) {
-                    eprintln!("Warning: Failed to save creatures: {}", e);
-                }
+                let part_count = count_spawned_parts(&champ.genotype);
+                let saved = SavedCreature::new(
+                    champ.genotype.clone(),
+                    champ.fitness,
+                    state.generation,
+                    part_count,
+                    s.id,
+                );
+                archive.upsert_species_champion(saved);
+            }
+        }
+
+        // Cap to the strongest distinct lineages so the file stays manageable;
+        // every survivor is still a different species, so diversity is kept.
+        archive.keep_best(24);
+
+        if let Some(ref path) = state.save_path {
+            if let Err(e) = archive.save(path) {
+                eprintln!("Warning: Failed to save creatures: {}", e);
             }
         }
     }
