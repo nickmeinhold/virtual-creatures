@@ -999,6 +999,13 @@ pub struct FitnessInputs {
     pub max_angspeed: f32,
     /// Accumulated mean angular motion (radians) post-settle (spin reward).
     pub total_spin: f32,
+    /// Time-averaged height of the highest part over the post-settle window —
+    /// reach rewards SUSTAINED height (a stable tower) rather than an
+    /// instantaneous peak (a spindly tower that spikes tall then topples).
+    pub sustained_top_height: f32,
+    /// Number of spawned parts — distance applies a mild complexity bonus to
+    /// nudge morphology past the trivial two-box local optimum.
+    pub part_count: usize,
 }
 
 /// Objective-dispatched fitness. Every mode shares the linear solver-fling guard
@@ -1018,7 +1025,14 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
                 return 0.0;
             }
             let horizontal = Vec2::new(f.end_pos.x - f.start_pos.x, f.end_pos.z - f.start_pos.z).length();
-            (horizontal / f.duration.max(1.0)).max(0.0)
+            let speed = (horizontal / f.duration.max(1.0)).max(0.0);
+            // Mild complexity bonus (EXPLORATORY): a 2-box inchworm is a strong
+            // local optimum because simple bodies are easy to make move. Nudge
+            // selection toward richer morphologies by rewarding extra parts a
+            // little — capped so it nudges exploration without paying for pure
+            // bloat. +4% per part beyond the first, up to +24% at 7 parts.
+            let bonus = 1.0 + 0.04 * f.part_count.saturating_sub(1).min(6) as f32;
+            speed * bonus
         }
         FitnessMode::Jump => {
             // A real jump launches the WHOLE body off the ground. Reward how high
@@ -1044,16 +1058,20 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
             (f.total_spin / active).max(0.0)
         }
         FitnessMode::Reach => {
-            // A tower, not a jump: disqualify only if the lowest part RISES
-            // meaningfully above where it settled — size-independent, so a
-            // tall-but-grounded body (whose feet rest above an absolute 0.6)
-            // isn't wrongly rejected. Reward the absolute height of the top part.
+            // A STABLE tower, not a jump or a topple. Disqualify if the lowest
+            // part rises meaningfully above where it settled (the body left the
+            // ground — that's a launch, not a reach).
             if !f.min_part_floor.is_finite()
                 || f.min_part_floor - f.settle_floor > 0.5
             {
                 return 0.0;
             }
-            f.peak_part_height.max(0.0)
+            // Reward SUSTAINED height (time-averaged top part over the run), not
+            // the instantaneous peak. A spindly tower that spikes to 13m for one
+            // frame then collapses has a low average; a stable tower that holds
+            // its height scores high — and, being stable, looks the same in the
+            // gallery bake as it did when scored.
+            f.sustained_top_height.max(0.0)
         }
     }
 }

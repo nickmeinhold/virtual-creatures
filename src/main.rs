@@ -725,6 +725,9 @@ struct CreatureTracker {
     max_angspeed: f32,
     /// Accumulated mean angular motion (radians, post-settle) — spin reward.
     total_spin: f32,
+    /// Time-integrated height of the highest part (post-settle), in metre·seconds
+    /// — divided by the active window to get reach's SUSTAINED-height reward.
+    sum_top_height: f32,
     /// Whether the post-spawn settle reset has happened yet this run.
     settled: bool,
 }
@@ -741,11 +744,13 @@ impl CreatureTracker {
         self.max_part_speed = 0.0;
         self.max_angspeed = 0.0;
         self.total_spin = 0.0;
+        self.sum_top_height = 0.0;
         self.settled = false;
     }
 
     /// Snapshot the telemetry into the objective-agnostic fitness inputs.
-    fn fitness_inputs(&self, start_pos: Vec3, duration: f32) -> FitnessInputs {
+    fn fitness_inputs(&self, start_pos: Vec3, duration: f32, part_count: usize) -> FitnessInputs {
+        let active = (duration - SETTLE_SECS).max(1.0);
         FitnessInputs {
             start_pos,
             end_pos: self.center,
@@ -758,6 +763,8 @@ impl CreatureTracker {
             max_part_speed: self.max_part_speed,
             max_angspeed: self.max_angspeed,
             total_spin: self.total_spin,
+            sustained_top_height: self.sum_top_height / active,
+            part_count,
         }
     }
 }
@@ -813,6 +820,7 @@ fn accumulate_telemetry(
             tracker.min_part_floor = frame_min_y;
             tracker.settle_floor = frame_min_y;
             tracker.total_spin = 0.0;
+            tracker.sum_top_height = 0.0;
             // Reset the cheat guards too, so the spawn-drop landing impact can't
             // disqualify a creature for a transient it never intended. Real
             // solver-vibration exploits are sustained and show up post-settle;
@@ -828,6 +836,10 @@ fn accumulate_telemetry(
     tracker.min_part_floor = tracker.min_part_floor.max(frame_min_y);
     if mean_angspeed.is_finite() {
         tracker.total_spin += mean_angspeed * SIM_DT;
+    }
+    // Integrate the top-part height over time for reach's sustained-height reward.
+    if frame_max_y.is_finite() {
+        tracker.sum_top_height += frame_max_y * SIM_DT;
     }
 }
 
@@ -988,7 +1000,7 @@ fn evolution_system(
         let skip_pressed = keyboard.just_pressed(KeyCode::Space);
         if elapsed >= config.test_duration || skip_pressed {
             let fitness = calculate_fitness(
-                &tracker.fitness_inputs(state.test_start_position, config.test_duration),
+                &tracker.fitness_inputs(state.test_start_position, config.test_duration, creature_parts.iter().count()),
             );
 
             let idx = state.current_individual;
@@ -1091,7 +1103,7 @@ fn evolution_system_headless(
         // Check if test duration elapsed
         if elapsed >= config.test_duration {
             let fitness = calculate_fitness(
-                &tracker.fitness_inputs(state.test_start_position, config.test_duration),
+                &tracker.fitness_inputs(state.test_start_position, config.test_duration, creature_parts.iter().count()),
             );
 
             let idx = state.current_individual;
