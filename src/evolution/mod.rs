@@ -376,6 +376,12 @@ pub struct EvolutionState {
     pub speciation_config: SpeciationConfig,
     /// Gene analytics: tracks building-block genes across generations
     pub gene_tracker: GeneTracker,
+    /// Per-generation history (preserves the evolutionary arc, unlike the
+    /// hall-of-fame `archive`). Recorded only when a history path is set.
+    pub history: Option<GenerationHistory>,
+    /// Path to save the per-generation history (from `VC_HISTORY`); `None`
+    /// disables history recording so default runs keep their old behavior.
+    pub history_path: Option<String>,
 }
 
 impl Default for EvolutionState {
@@ -396,6 +402,10 @@ impl Default for EvolutionState {
             next_species_id: 0,
             speciation_config: SpeciationConfig::default(),
             gene_tracker: GeneTracker::new(),
+            // Opt-in: only record per-generation history when VC_HISTORY is set,
+            // so ordinary runs pay nothing and keep producing just creatures.json.
+            history_path: std::env::var("VC_HISTORY").ok(),
+            history: std::env::var("VC_HISTORY").ok().map(|_| GenerationHistory::new()),
         }
     }
 }
@@ -1264,6 +1274,48 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
         }
     }
 
+    // Record this generation's strongest creatures into the per-generation
+    // history (opt-in via VC_HISTORY). The archive above keeps one champion per
+    // species and OVERWRITES as lineages improve — collapsing time. This instead
+    // PRESERVES each generation so the gallery can replay the evolutionary arc.
+    // Read raw fitness here, BEFORE the fitness sharing below rescales it.
+    if state.history.is_some() {
+        /// Creatures kept per generation in the history (best-first).
+        const TOP_PER_GEN: usize = 4;
+
+        // Rank the do-something creatures of this generation by raw fitness.
+        let mut ranked: Vec<usize> = (0..state.population.len())
+            .filter(|&i| state.population[i].fitness >= 0.04)
+            .collect();
+        ranked.sort_by(|&a, &b| {
+            state.population[b].fitness.partial_cmp(&state.population[a].fitness).unwrap()
+        });
+
+        // Map population index -> species id so the gallery can colour lineages.
+        let mut species_of = vec![0usize; state.population.len()];
+        for s in &state.species {
+            for &m in &s.members {
+                if m < species_of.len() { species_of[m] = s.id; }
+            }
+        }
+
+        let snapshot: Vec<SavedCreature> = ranked.iter().take(TOP_PER_GEN).map(|&i| {
+            let ind = &state.population[i];
+            let part_count = count_spawned_parts(&ind.genotype);
+            SavedCreature::new(ind.genotype.clone(), ind.fitness, state.generation, part_count, species_of[i])
+        }).collect();
+
+        let gen = state.generation;
+        if let Some(ref mut history) = state.history {
+            history.record(gen, snapshot);
+            if let Some(ref path) = state.history_path {
+                if let Err(e) = history.save(path) {
+                    eprintln!("Warning: Failed to save history: {}", e);
+                }
+            }
+        }
+    }
+
     // Step 4: Apply fitness sharing (divide by species size)
     // This ensures small novel species get a fair share of reproduction.
     apply_fitness_sharing(&mut state.population, &state.species);
@@ -1362,6 +1414,20 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
     // Print building block summary every 10 generations
     if state.generation % 10 == 0 {
         state.gene_tracker.print_summary(5);
+    }
+
+    // Optional hard stop for reproducible, bounded runs (e.g. baking history for
+    // the web gallery): exit cleanly once the requested generation count is
+    // reached. The archive and per-generation history for every completed
+    // generation are already flushed to disk above, so exiting here loses
+    // nothing. Only active when VC_MAX_GEN is set, so normal runs are unbounded.
+    if let Ok(max) = std::env::var("VC_MAX_GEN") {
+        if let Ok(max) = max.parse::<usize>() {
+            if state.generation >= max {
+                println!("Reached VC_MAX_GEN={max} — stopping.");
+                std::process::exit(0);
+            }
+        }
     }
 }
 

@@ -94,6 +94,51 @@ impl CreatureArchive {
     }
 }
 
+/// One generation's snapshot: the strongest creatures alive at that generation.
+///
+/// Unlike [`CreatureArchive`] — a per-species hall of fame that *overwrites*
+/// each lineage's entry as it improves — this PRESERVES history: one entry per
+/// generation, recorded as evolution runs. That's what lets the gallery replay
+/// the evolutionary arc (gen 0 → gen N) rather than only the final survivors.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GenerationSnapshot {
+    /// Generation index this snapshot was taken at.
+    pub gen: usize,
+    /// Top creatures of this generation, ranked best-first (caller pre-ranks).
+    pub creatures: Vec<SavedCreature>,
+}
+
+/// The full per-generation history of a single evolution run.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct GenerationHistory {
+    pub generations: Vec<GenerationSnapshot>,
+}
+
+impl GenerationHistory {
+    pub fn new() -> Self {
+        Self { generations: Vec::new() }
+    }
+
+    /// Append one generation's snapshot. The caller is responsible for filtering
+    /// (e.g. dropping do-nothing blobs) and ranking the creatures best-first.
+    pub fn record(&mut self, gen: usize, creatures: Vec<SavedCreature>) {
+        self.generations.push(GenerationSnapshot { gen, creatures });
+    }
+
+    /// Save to a JSON file.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        fs::write(path, json)
+    }
+
+    /// Load from a JSON file.
+    #[allow(dead_code)]
+    pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let json = fs::read_to_string(path)?;
+        serde_json::from_str(&json).map_err(io::Error::other)
+    }
+}
+
 /// Save a single creature to a file
 #[allow(dead_code)]
 pub fn save_creature<P: AsRef<Path>>(creature: &SavedCreature, path: P) -> io::Result<()> {

@@ -39,6 +39,9 @@ struct SimulationOptions {
     replay: Option<String>,
     /// Export mode: bake saved creatures to a web-playable JSON at this path
     export: Option<String>,
+    /// Export-history mode: bake the per-generation history files (history-*.json,
+    /// one per objective) into one multi-objective web gallery at this path.
+    export_history: Option<String>,
 }
 
 impl Default for SimulationOptions {
@@ -49,6 +52,7 @@ impl Default for SimulationOptions {
             verbose: true,
             replay: None,
             export: None,
+            export_history: None,
         }
     }
 }
@@ -85,6 +89,15 @@ fn parse_args() -> SimulationOptions {
                     opts.export = Some("creatures-web.json".to_string());
                 }
             }
+            "--export-history" => {
+                // Optional output path; default creatures-web.json.
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    opts.export_history = Some(args[i].clone());
+                } else {
+                    opts.export_history = Some("creatures-web.json".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
@@ -94,6 +107,7 @@ fn parse_args() -> SimulationOptions {
                 println!("  --quiet, -q       Reduce output verbosity");
                 println!("  --replay, -r FILE Load and watch saved creatures (default: creatures.json)");
                 println!("  --export, -e FILE Bake creatures.json to web-playable JSON (default: creatures-web.json)");
+                println!("  --export-history FILE  Bake history-<objective>.json files into one multi-objective gallery");
                 println!("  --help, -h        Show this help message");
                 println!();
                 println!("Examples:");
@@ -113,7 +127,9 @@ fn parse_args() -> SimulationOptions {
 fn main() {
     let opts = parse_args();
 
-    if let Some(ref out) = opts.export {
+    if let Some(ref out) = opts.export_history {
+        run_export_history(opts.clone(), out.clone());
+    } else if let Some(ref out) = opts.export {
         run_export(opts.clone(), out.clone());
     } else if let Some(ref path) = opts.replay {
         run_replay(opts.clone(), path.clone());
@@ -173,17 +189,31 @@ fn run_headless(opts: SimulationOptions) {
     app.run();
 }
 
-/// State for export mode: walk the archive, simulate each creature, and bake
-/// its per-frame poses into a web-playable gallery.
+/// One creature to bake, tagged with the objective it belongs to so the baked
+/// output can be grouped back into the multi-objective gallery.
+struct ExportJob {
+    genotype: genotype::CreatureGenotype,
+    fitness: f32,
+    generation: usize,
+    species_id: usize,
+    /// Index into `ExportState::objectives_meta`.
+    obj_idx: usize,
+}
+
+/// State for export mode: walk a flat job list, simulate each creature, bake its
+/// per-frame poses, then assemble the results into a multi-objective gallery.
 #[derive(Resource)]
 struct ExportState {
-    archive: genotype::CreatureArchive,
+    jobs: Vec<ExportJob>,
+    /// `(key, label, unit)` per objective, indexed by `ExportJob::obj_idx`.
+    objectives_meta: Vec<(String, String, String)>,
     out_path: String,
     fps: u32,
     /// Seconds of motion to record per creature.
     duration: f32,
     current_index: usize,
-    gallery: export::WebGallery,
+    /// Baked creatures tagged with their objective index, assembled on finish.
+    baked: Vec<(usize, export::WebCreature)>,
     /// Part entities of the creature being recorded, in stable spawn order.
     part_entities: Vec<Entity>,
     /// Box dimensions per part (same order as `part_entities`).
@@ -194,6 +224,8 @@ struct ExportState {
     start_time: Option<f32>,
 }
 
+/// Legacy single-objective export: bake the `creatures.json` hall-of-fame into
+/// the (now multi-objective) web schema as a single "distance" objective.
 fn run_export(opts: SimulationOptions, out_path: String) {
     let mut archive = match genotype::CreatureArchive::load("creatures.json") {
         Ok(a) => a,
@@ -207,17 +239,98 @@ fn run_export(opts: SimulationOptions, out_path: String) {
         std::process::exit(1);
     }
 
-    // Export only the strongest distinct lineages — the gallery showcases the
-    // top handful, and this keeps the web payload light.
+    // Export only the strongest distinct lineages — keeps the web payload light.
     archive.creatures.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
-    // 12 matches the gallery's per-objective showcase count; with four
-    // objectives this keeps the combined web payload reasonable.
     archive.creatures.truncate(12);
 
-    let fps = 24;
-    let n = archive.creatures.len();
-    println!("Exporting {} creatures to '{}' ({} fps)...", n, out_path, fps);
+    let jobs = archive
+        .creatures
+        .into_iter()
+        .map(|c| ExportJob {
+            genotype: c.genotype,
+            fitness: c.fitness,
+            generation: c.generation,
+            species_id: c.species_id,
+            obj_idx: 0,
+        })
+        .collect();
+    let meta = vec![(
+        "distance".to_string(),
+        "distance travelled".to_string(),
+        "m/s".to_string(),
+    )];
+    run_export_jobs(opts, out_path, jobs, meta);
+}
 
+/// The four objectives and the per-objective history files they bake from.
+/// `(key, label, unit, history_file)` — labels/units live here (not in a
+/// hand-assembled JSON) so the gallery is reproducible.
+const OBJECTIVES: &[(&str, &str, &str, &str)] = &[
+    ("distance", "distance travelled", "m/s", "history-distance.json"),
+    ("jump", "jump height", "m", "history-jump.json"),
+    ("spin", "rotation", "rad/s", "history-spin.json"),
+    ("reach", "reach height", "m", "history-reach.json"),
+];
+
+/// Creatures baked per generation (the creature axis in the gallery). Kept small
+/// because per-frame pose data dominates the web payload; the history files
+/// retain more, so this can be raised without re-running evolution.
+const CREATURES_PER_GEN: usize = 3;
+
+/// Per-generation export: bake every objective's `history-<obj>.json` into one
+/// multi-objective, generation-indexed gallery so the viewer can replay the
+/// full evolutionary arc. Objectives whose history file is missing are skipped.
+fn run_export_history(opts: SimulationOptions, out_path: String) {
+    let mut jobs: Vec<ExportJob> = Vec::new();
+    let mut meta: Vec<(String, String, String)> = Vec::new();
+
+    for (key, label, unit, file) in OBJECTIVES {
+        let history = match genotype::GenerationHistory::load(file) {
+            Ok(h) => h,
+            Err(_) => {
+                eprintln!("Skipping objective '{}' — no '{}' found.", key, file);
+                continue;
+            }
+        };
+        let obj_idx = meta.len();
+        meta.push((key.to_string(), label.to_string(), unit.to_string()));
+        for snap in history.generations {
+            // Bake only the strongest few per generation to bound the web
+            // payload — pose frames dominate the file size. History is stored
+            // best-first, so a prefix is the top creatures of the generation.
+            for c in snap.creatures.into_iter().take(CREATURES_PER_GEN) {
+                jobs.push(ExportJob {
+                    genotype: c.genotype,
+                    fitness: c.fitness,
+                    generation: snap.gen,
+                    species_id: c.species_id,
+                    obj_idx,
+                });
+            }
+        }
+    }
+
+    if jobs.is_empty() {
+        eprintln!("No history files found (expected history-<objective>.json). Run evolution with VC_HISTORY set first.");
+        std::process::exit(1);
+    }
+    println!(
+        "Exporting {} creatures across {} objective(s) to '{}'...",
+        jobs.len(),
+        meta.len(),
+        out_path
+    );
+    run_export_jobs(opts, out_path, jobs, meta);
+}
+
+/// Shared driver: set up a headless physics app to bake every job in `jobs`.
+fn run_export_jobs(
+    opts: SimulationOptions,
+    out_path: String,
+    jobs: Vec<ExportJob>,
+    objectives_meta: Vec<(String, String, String)>,
+) {
+    let fps = 24;
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.add_plugins(bevy::asset::AssetPlugin::default());
@@ -232,12 +345,13 @@ fn run_export(opts: SimulationOptions, out_path: String) {
     app.insert_resource(opts);
     app.insert_resource(SimulatedTime::default());
     app.insert_resource(ExportState {
-        archive,
+        jobs,
+        objectives_meta,
         out_path,
         fps,
         duration: 6.0,
         current_index: 0,
-        gallery: export::WebGallery::new(fps),
+        baked: Vec::new(),
         part_entities: Vec::new(),
         part_dims: Vec::new(),
         frames: Vec::new(),
@@ -271,21 +385,25 @@ fn export_system(
 
     // No creature in the world: either finish, or spawn the next one.
     if creatures.is_empty() {
-        if state.current_index >= state.archive.creatures.len() {
-            // Done — write the gallery and exit.
-            if let Err(e) = state.gallery.save(&state.out_path) {
+        if state.current_index >= state.jobs.len() {
+            // Done — assemble the multi-objective gallery and write it out.
+            let baked = std::mem::take(&mut state.baked);
+            let n = baked.len();
+            let gallery = export::WebMultiGallery::assemble(state.fps, &state.objectives_meta, baked);
+            if let Err(e) = gallery.save(&state.out_path) {
                 eprintln!("Failed to write {}: {}", state.out_path, e);
                 std::process::exit(1);
             }
             println!(
-                "Wrote {} creatures to '{}'.",
-                state.gallery.creatures.len(),
+                "Wrote {} creatures across {} objective(s) to '{}'.",
+                n,
+                gallery.objectives.len(),
                 state.out_path
             );
             std::process::exit(0);
         }
 
-        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let genotype = state.jobs[state.current_index].genotype.clone();
         let spawned = spawn_creature_headless(&mut commands, &genotype, Vec3::new(0.0, 2.0, 0.0));
         for entity in &spawned.parts {
             commands.entity(*entity).insert(TestCreature);
@@ -304,7 +422,7 @@ fn export_system(
     // Lazily fill dims the first tick the parts are queryable, and anchor the
     // recording clock to that moment.
     if state.start_time.is_none() {
-        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let genotype = state.jobs[state.current_index].genotype.clone();
         let entities = state.part_entities.clone();
         let mut dims = vec![[0.0f32; 3]; entities.len()];
         for (i, entity) in entities.iter().enumerate() {
@@ -343,16 +461,16 @@ fn export_system(
 
     // Finished recording this creature: stash it and tear down for the next.
     if state.frames.len() >= total_frames {
-        let id = state.current_index;
-        let (fitness, generation, species_id) = {
-            let saved = &state.archive.creatures[id];
-            (saved.fitness, saved.generation, saved.species_id)
+        let idx = state.current_index;
+        let (fitness, generation, species_id, obj_idx) = {
+            let job = &state.jobs[idx];
+            (job.fitness, job.generation, job.species_id, job.obj_idx)
         };
         let frames = std::mem::take(&mut state.frames);
         let parts = state.part_dims.iter().map(|d| export::WebPart { dims: *d }).collect();
-        let web = export::WebCreature { id, fitness, generation, species_id, parts, frames };
-        println!("  baked creature {} (fitness {:.3})", id, fitness);
-        state.gallery.creatures.push(web);
+        let web = export::WebCreature { id: idx, fitness, generation, species_id, parts, frames };
+        println!("  baked creature {} (obj {}, gen {}, fitness {:.3})", idx, obj_idx, generation, fitness);
+        state.baked.push((obj_idx, web));
         state.current_index += 1;
 
         for entity in creatures.iter() {
