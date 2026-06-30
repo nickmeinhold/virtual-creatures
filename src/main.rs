@@ -243,57 +243,65 @@ fn run_export(opts: SimulationOptions, out_path: String) {
     archive.creatures.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
     archive.creatures.truncate(12);
 
+    // `creatures.json` is a hall of fame: one champion per species, collected
+    // across ARBITRARY generations — not an evolutionary timeline. Bake it as a
+    // single generation bucket (generation 0) so the gallery presents it as one
+    // showcase, not a fake one-creature-per-generation arc. The honest
+    // evolutionary timeline comes from `--export-history` instead.
     let jobs = archive
         .creatures
         .into_iter()
         .map(|c| ExportJob {
             genotype: c.genotype,
             fitness: c.fitness,
-            generation: c.generation,
+            generation: 0,
             species_id: c.species_id,
             obj_idx: 0,
         })
         .collect();
     let meta = vec![(
-        "distance".to_string(),
-        "distance travelled".to_string(),
-        "m/s".to_string(),
+        FitnessMode::Distance.key().to_string(),
+        FitnessMode::Distance.label().to_string(),
+        FitnessMode::Distance.unit().to_string(),
     )];
     run_export_jobs(opts, out_path, jobs, meta);
 }
 
-/// The four objectives and the per-objective history files they bake from.
-/// `(key, label, unit, history_file)` — labels/units live here (not in a
-/// hand-assembled JSON) so the gallery is reproducible.
-const OBJECTIVES: &[(&str, &str, &str, &str)] = &[
-    ("distance", "distance travelled", "m/s", "history-distance.json"),
-    ("jump", "jump height", "m", "history-jump.json"),
-    ("spin", "rotation", "rad/s", "history-spin.json"),
-    ("reach", "reach height", "m", "history-reach.json"),
-];
-
 /// Creatures baked per generation (the creature axis in the gallery). Kept small
 /// because per-frame pose data dominates the web payload; the history files
-/// retain more, so this can be raised without re-running evolution.
+/// retain more per generation (`TOP_PER_GEN` in evolution::evolve_generation, 4),
+/// so this can be raised up to that without re-running evolution. The asymmetry
+/// is deliberate: capture generously, ship lean.
 const CREATURES_PER_GEN: usize = 3;
 
 /// Per-generation export: bake every objective's `history-<obj>.json` into one
 /// multi-objective, generation-indexed gallery so the viewer can replay the
-/// full evolutionary arc. Objectives whose history file is missing are skipped.
+/// full evolutionary arc. A *missing* history file is skipped (that objective
+/// simply wasn't evolved); a history file that exists but fails to read (corrupt
+/// JSON, permissions) is a HARD error — silently shipping an incomplete gallery
+/// that looks complete would violate the reproducibility contract.
 fn run_export_history(opts: SimulationOptions, out_path: String) {
+    use std::io::ErrorKind;
     let mut jobs: Vec<ExportJob> = Vec::new();
     let mut meta: Vec<(String, String, String)> = Vec::new();
 
-    for (key, label, unit, file) in OBJECTIVES {
-        let history = match genotype::GenerationHistory::load(file) {
+    // Objective identity (key/label/unit/filename) comes from the FitnessMode
+    // enum — the single source of truth — not a parallel string table.
+    for mode in FitnessMode::ALL {
+        let file = mode.history_file();
+        let history = match genotype::GenerationHistory::load(&file) {
             Ok(h) => h,
-            Err(_) => {
-                eprintln!("Skipping objective '{}' — no '{}' found.", key, file);
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                eprintln!("Skipping objective '{}' — no '{}' found.", mode.key(), file);
                 continue;
+            }
+            Err(e) => {
+                eprintln!("Error reading '{}' for objective '{}': {}", file, mode.key(), e);
+                std::process::exit(1);
             }
         };
         let obj_idx = meta.len();
-        meta.push((key.to_string(), label.to_string(), unit.to_string()));
+        meta.push((mode.key().to_string(), mode.label().to_string(), mode.unit().to_string()));
         for snap in history.generations {
             // Bake only the strongest few per generation to bound the web
             // payload — pose frames dominate the file size. History is stored

@@ -109,6 +109,14 @@ pub struct GenerationSnapshot {
 }
 
 /// The full per-generation history of a single evolution run.
+///
+/// Tradeoffs (accepted for the bake use-case, called out rather than hidden):
+/// - `save` rewrites the whole file each generation, so total IO over a run is
+///   O(generations²). Fine for the ~18-generation bake runs this serves; revisit
+///   with an append format if histories ever get long.
+/// - Not resume-safe: a fresh process starts an empty in-memory history and
+///   overwrites the file on its first save. These are one-shot bake runs, so
+///   that's intended — don't point two runs at the same `VC_HISTORY` path.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GenerationHistory {
     pub generations: Vec<GenerationSnapshot>,

@@ -70,6 +70,53 @@ pub enum FitnessMode {
     Reach,
 }
 
+impl FitnessMode {
+    /// Every objective, in gallery/display order. The single source of truth for
+    /// "what objectives exist" — iterate this rather than re-listing the variants.
+    pub const ALL: [FitnessMode; 4] = [
+        FitnessMode::Distance,
+        FitnessMode::Jump,
+        FitnessMode::Spin,
+        FitnessMode::Reach,
+    ];
+
+    /// Stable key, identical to the accepted `VC_FITNESS` value (e.g. "distance").
+    pub fn key(self) -> &'static str {
+        match self {
+            FitnessMode::Distance => "distance",
+            FitnessMode::Jump => "jump",
+            FitnessMode::Spin => "spin",
+            FitnessMode::Reach => "reach",
+        }
+    }
+
+    /// Human label shown in the web gallery (e.g. "distance travelled").
+    pub fn label(self) -> &'static str {
+        match self {
+            FitnessMode::Distance => "distance travelled",
+            FitnessMode::Jump => "jump height",
+            FitnessMode::Spin => "rotation",
+            FitnessMode::Reach => "reach height",
+        }
+    }
+
+    /// Fitness unit (e.g. "m/s") — what the displayed score is measured in.
+    pub fn unit(self) -> &'static str {
+        match self {
+            FitnessMode::Distance => "m/s",
+            FitnessMode::Jump => "m",
+            FitnessMode::Spin => "rad/s",
+            FitnessMode::Reach => "m",
+        }
+    }
+
+    /// Default per-objective history filename, matching the `VC_HISTORY`
+    /// convention used when evolving each objective.
+    pub fn history_file(self) -> String {
+        format!("history-{}.json", self.key())
+    }
+}
+
 pub fn fitness_mode() -> FitnessMode {
     static M: OnceLock<FitnessMode> = OnceLock::new();
     *M.get_or_init(|| match std::env::var("VC_FITNESS").as_deref() {
