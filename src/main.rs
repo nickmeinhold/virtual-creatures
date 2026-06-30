@@ -4,12 +4,27 @@ use std::env;
 
 mod brain;
 mod evolution;
+mod export;
 mod genotype;
 mod phenotype;
 
 use brain::{Brain, BrainPlugin};
 use evolution::*;
 use phenotype::*;
+
+/// Fixed simulation timestep (seconds) shared by physics, the brain, and trial
+/// duration accounting. Decoupling the sim from wall-clock time is what lets
+/// headless evolution run as fast as the CPU allows *without* distorting
+/// evaluation: every tick advances physics, brain, and the duration clock by
+/// exactly this much, so a 10 "second" trial is always 600 faithful steps
+/// regardless of how fast the loop spins.
+pub const SIM_DT: f32 = 1.0 / 60.0;
+
+/// Rapier's `TimestepMode` pinned to a fixed per-tick step. Without this the
+/// plugin defaults to `Variable` (steps by real `Time::delta`), which made the
+/// `--speed` multiplier silently judge creatures on a fraction of their
+/// intended physics. Inserted as a resource before the app runs.
+const FIXED_TIMESTEP: TimestepMode = TimestepMode::Fixed { dt: SIM_DT, substeps: 1 };
 
 /// Command-line options for the simulation
 #[derive(Resource, Clone)]
@@ -22,6 +37,8 @@ struct SimulationOptions {
     verbose: bool,
     /// Replay mode: load and watch saved creatures
     replay: Option<String>,
+    /// Export mode: bake saved creatures to a web-playable JSON at this path
+    export: Option<String>,
 }
 
 impl Default for SimulationOptions {
@@ -31,6 +48,7 @@ impl Default for SimulationOptions {
             speed: 1.0,
             verbose: true,
             replay: None,
+            export: None,
         }
     }
 }
@@ -58,6 +76,15 @@ fn parse_args() -> SimulationOptions {
                     opts.replay = Some("creatures.json".to_string());
                 }
             }
+            "--export" | "-e" => {
+                // Optional output path; default creatures-web.json.
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    opts.export = Some(args[i].clone());
+                } else {
+                    opts.export = Some("creatures-web.json".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
@@ -66,6 +93,7 @@ fn parse_args() -> SimulationOptions {
                 println!("  --speed, -s N     Simulation speed multiplier (default: 1.0)");
                 println!("  --quiet, -q       Reduce output verbosity");
                 println!("  --replay, -r FILE Load and watch saved creatures (default: creatures.json)");
+                println!("  --export, -e FILE Bake creatures.json to web-playable JSON (default: creatures-web.json)");
                 println!("  --help, -h        Show this help message");
                 println!();
                 println!("Examples:");
@@ -85,7 +113,9 @@ fn parse_args() -> SimulationOptions {
 fn main() {
     let opts = parse_args();
 
-    if let Some(ref path) = opts.replay {
+    if let Some(ref out) = opts.export {
+        run_export(opts.clone(), out.clone());
+    } else if let Some(ref path) = opts.replay {
         run_replay(opts.clone(), path.clone());
     } else if opts.headless {
         run_headless(opts);
@@ -101,9 +131,12 @@ fn run_with_graphics(opts: SimulationOptions) {
         .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
+        // Unified fixed timestep across ALL modes: the brain steps SIM_DT per
+        // tick, so physics must too, or the two desync at non-60Hz framerates.
+        .insert_resource(FIXED_TIMESTEP)
         .insert_resource(EvolutionConfig::default())
         .insert_resource(EvolutionState::default())
-        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0) })
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 1.0, 0.0), ..default() })
         .add_systems(Startup, setup_with_graphics)
         .add_systems(Update, (evolution_system, camera_follow))
         .run();
@@ -130,6 +163,7 @@ fn run_headless(opts: SimulationOptions) {
     app.insert_resource(EvolutionConfig::default());
     app.insert_resource(EvolutionState::default());
     app.insert_resource(SimulationSpeed(speed));
+    app.insert_resource(FIXED_TIMESTEP);
     app.add_systems(Startup, setup_headless);
     app.add_systems(Update, (advance_simulation_time, evolution_system_headless));
 
@@ -137,6 +171,192 @@ fn run_headless(opts: SimulationOptions) {
     println!("Press Ctrl+C to stop\n");
 
     app.run();
+}
+
+/// State for export mode: walk the archive, simulate each creature, and bake
+/// its per-frame poses into a web-playable gallery.
+#[derive(Resource)]
+struct ExportState {
+    archive: genotype::CreatureArchive,
+    out_path: String,
+    fps: u32,
+    /// Seconds of motion to record per creature.
+    duration: f32,
+    current_index: usize,
+    gallery: export::WebGallery,
+    /// Part entities of the creature being recorded, in stable spawn order.
+    part_entities: Vec<Entity>,
+    /// Box dimensions per part (same order as `part_entities`).
+    part_dims: Vec<[f32; 3]>,
+    /// Accumulated poses: frames[f][p].
+    frames: Vec<Vec<[f32; 7]>>,
+    /// Sim time at which recording for the current creature began.
+    start_time: Option<f32>,
+}
+
+fn run_export(opts: SimulationOptions, out_path: String) {
+    let mut archive = match genotype::CreatureArchive::load("creatures.json") {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error loading creatures.json: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if archive.creatures.is_empty() {
+        eprintln!("No creatures in creatures.json to export.");
+        std::process::exit(1);
+    }
+
+    // Export only the strongest distinct lineages — the gallery showcases the
+    // top handful, and this keeps the web payload light.
+    archive.creatures.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+    archive.creatures.truncate(16);
+
+    let fps = 24;
+    let n = archive.creatures.len();
+    println!("Exporting {} creatures to '{}' ({} fps)...", n, out_path, fps);
+
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(bevy::asset::AssetPlugin::default());
+    app.add_plugins(bevy::scene::ScenePlugin);
+    app.init_resource::<Assets<Mesh>>();
+    app.add_plugins(RapierPhysicsPlugin::<NoUserData>::default());
+    app.add_plugins(BrainPlugin);
+    // Record at realtime so physics integrates with full fidelity — a high
+    // speed multiplier would take fewer physics steps per recorded second and
+    // make the baked motion choppy.
+    app.insert_resource(SimulationSpeed(1.0));
+    app.insert_resource(opts);
+    app.insert_resource(SimulatedTime::default());
+    app.insert_resource(ExportState {
+        archive,
+        out_path,
+        fps,
+        duration: 8.0,
+        current_index: 0,
+        gallery: export::WebGallery::new(fps),
+        part_entities: Vec::new(),
+        part_dims: Vec::new(),
+        frames: Vec::new(),
+        start_time: None,
+    });
+    app.insert_resource(FIXED_TIMESTEP);
+    app.add_systems(Startup, setup_export);
+    app.add_systems(Update, (advance_simulation_time, export_system));
+    app.run();
+}
+
+fn setup_export(mut commands: Commands) {
+    // Ground plane (collider only; no mesh needed headless).
+    commands.spawn((
+        Collider::halfspace(Vec3::Y).unwrap(),
+        CollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_system(
+    mut commands: Commands,
+    sim_time: Res<SimulatedTime>,
+    mut state: ResMut<ExportState>,
+    creatures: Query<Entity, With<TestCreature>>,
+    parts_q: Query<(&CreaturePart, &Transform)>,
+) {
+    let t = sim_time.elapsed;
+    let total_frames = (state.duration * state.fps as f32).round() as usize;
+
+    // No creature in the world: either finish, or spawn the next one.
+    if creatures.is_empty() {
+        if state.current_index >= state.archive.creatures.len() {
+            // Done — write the gallery and exit.
+            if let Err(e) = state.gallery.save(&state.out_path) {
+                eprintln!("Failed to write {}: {}", state.out_path, e);
+                std::process::exit(1);
+            }
+            println!(
+                "Wrote {} creatures to '{}'.",
+                state.gallery.creatures.len(),
+                state.out_path
+            );
+            std::process::exit(0);
+        }
+
+        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let spawned = spawn_creature_headless(&mut commands, &genotype, Vec3::new(0.0, 2.0, 0.0));
+        for entity in &spawned.parts {
+            commands.entity(*entity).insert(TestCreature);
+        }
+        commands.entity(spawned.root).insert(TestCreature);
+        commands.entity(spawned.creature_entity).insert(Brain::new(genotype.clone()));
+
+        // Record part dimensions in spawn order so they line up with poses.
+        state.part_dims = spawned.parts.iter().map(|_| [0.0; 3]).collect();
+        state.part_entities = spawned.parts.clone();
+        state.frames.clear();
+        state.start_time = None;
+        return;
+    }
+
+    // Lazily fill dims the first tick the parts are queryable, and anchor the
+    // recording clock to that moment.
+    if state.start_time.is_none() {
+        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let entities = state.part_entities.clone();
+        let mut dims = vec![[0.0f32; 3]; entities.len()];
+        for (i, entity) in entities.iter().enumerate() {
+            if let Ok((cp, _)) = parts_q.get(*entity) {
+                if let Some(node) = genotype.morphology.get_node(cp.node_id) {
+                    let d = node.dimensions;
+                    dims[i] = [d.x, d.y, d.z];
+                }
+            }
+        }
+        state.part_dims = dims;
+        state.start_time = Some(t);
+    }
+
+    let local = t - state.start_time.unwrap();
+
+    // Sample one pose whenever the playback grid advances past a new frame.
+    if local >= state.frames.len() as f32 / state.fps as f32 && state.frames.len() < total_frames {
+        let entities = state.part_entities.clone();
+        let mut pose = Vec::with_capacity(entities.len());
+        // Quantize to keep the web JSON small: positions to mm, quaternions to
+        // 1e-4. Visually lossless for a card-sized canvas, ~2x smaller on disk.
+        let qpos = |v: f32| (v * 1000.0).round() / 1000.0;
+        let qrot = |v: f32| (v * 10000.0).round() / 10000.0;
+        for entity in &entities {
+            if let Ok((_, tf)) = parts_q.get(*entity) {
+                let p = tf.translation;
+                let q = tf.rotation;
+                pose.push([qpos(p.x), qpos(p.y), qpos(p.z), qrot(q.x), qrot(q.y), qrot(q.z), qrot(q.w)]);
+            } else {
+                pose.push([0.0; 7]);
+            }
+        }
+        state.frames.push(pose);
+    }
+
+    // Finished recording this creature: stash it and tear down for the next.
+    if state.frames.len() >= total_frames {
+        let id = state.current_index;
+        let (fitness, generation, species_id) = {
+            let saved = &state.archive.creatures[id];
+            (saved.fitness, saved.generation, saved.species_id)
+        };
+        let frames = std::mem::take(&mut state.frames);
+        let parts = state.part_dims.iter().map(|d| export::WebPart { dims: *d }).collect();
+        let web = export::WebCreature { id, fitness, generation, species_id, parts, frames };
+        println!("  baked creature {} (fitness {:.3})", id, fitness);
+        state.gallery.creatures.push(web);
+        state.current_index += 1;
+
+        for entity in creatures.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
 }
 
 /// Resource to track simulation speed
@@ -187,8 +407,10 @@ fn run_replay(opts: SimulationOptions, path: String) {
         .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(BrainPlugin)
         .insert_resource(opts)
+        // Same unified fixed timestep as every other mode (see run_with_graphics).
+        .insert_resource(FIXED_TIMESTEP)
         .insert_resource(replay_state)
-        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0) })
+        .insert_resource(CreatureTracker { center: Vec3::new(0.0, 2.0, 0.0), ..default() })
         .add_systems(Startup, setup_replay)
         .add_systems(Update, (replay_system, camera_follow))
         .run();
@@ -315,10 +537,16 @@ fn replay_system(
 #[derive(Component)]
 struct TestCreature;
 
-/// Resource to track creature's center of mass
+/// Resource to track creature's center of mass and physics-cheat telemetry
 #[derive(Resource, Default)]
 struct CreatureTracker {
     center: Vec3,
+    /// Highest center-of-mass Y reached during the run (catches launchers that
+    /// fly across and land low, which the end-of-run height penalty misses).
+    peak_height: f32,
+    /// Fastest single part speed (linear, m/s) seen during the run. A legit
+    /// gait stays modest; solver-exploit vibration spikes this.
+    max_part_speed: f32,
 }
 
 /// Simulated elapsed time for headless mode
@@ -385,13 +613,12 @@ fn setup_headless(
     commands.insert_resource(SimulatedTime::default());
 }
 
-/// Advance simulation time faster in headless mode
-fn advance_simulation_time(
-    mut sim_time: ResMut<SimulatedTime>,
-    time: Res<Time>,
-    speed: Res<SimulationSpeed>,
-) {
-    sim_time.elapsed += time.delta_secs() * speed.0;
+/// Advance the simulation clock by one fixed step per tick, matching the fixed
+/// physics timestep. The loop runs uncapped headless, so wall-clock speed comes
+/// from how fast ticks fire — not from scaling time, which would desync the
+/// duration clock from the physics the creature actually experiences.
+fn advance_simulation_time(mut sim_time: ResMut<SimulatedTime>) {
+    sim_time.elapsed += SIM_DT;
 }
 
 /// Main evolution system (with graphics)
@@ -407,7 +634,7 @@ fn evolution_system(
     opts: Res<SimulationOptions>,
     keyboard: Res<ButtonInput<KeyCode>>,
     creatures: Query<Entity, With<TestCreature>>,
-    creature_parts: Query<(&CreaturePart, &Transform)>,
+    creature_parts: Query<(&CreaturePart, &Transform, &Velocity)>,
 ) {
     // Wait for physics to initialize
     if state.frames_before_spawn > 0 {
@@ -457,6 +684,8 @@ fn evolution_system(
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
             tracker.center = spawn_pos;
+            tracker.peak_height = spawn_pos.y;
+            tracker.max_part_speed = 0.0;
 
             if opts.verbose {
                 println!(
@@ -472,17 +701,24 @@ fn evolution_system(
             }
         }
     } else {
-        // Update center of mass tracking
+        // Update center of mass tracking + physics-cheat telemetry
         let mut total_pos = Vec3::ZERO;
         let mut count = 0;
-        for (_, transform) in creature_parts.iter() {
+        for (_, transform, velocity) in creature_parts.iter() {
             total_pos += transform.translation;
             count += 1;
+            let speed = velocity.linvel.length();
+            if speed.is_finite() && speed > tracker.max_part_speed {
+                tracker.max_part_speed = speed;
+            }
         }
         if count > 0 {
             let new_center = total_pos / count as f32;
             if new_center.is_finite() {
                 tracker.center = new_center;
+                if new_center.y > tracker.peak_height {
+                    tracker.peak_height = new_center.y;
+                }
             }
         }
 
@@ -495,6 +731,8 @@ fn evolution_system(
                 state.test_start_position,
                 tracker.center,
                 config.test_duration,
+                tracker.peak_height,
+                tracker.max_part_speed,
             );
 
             let idx = state.current_individual;
@@ -534,7 +772,7 @@ fn evolution_system_headless(
     mut tracker: ResMut<CreatureTracker>,
     opts: Res<SimulationOptions>,
     creatures: Query<Entity, With<TestCreature>>,
-    creature_parts: Query<(&CreaturePart, &Transform)>,
+    creature_parts: Query<(&CreaturePart, &Transform, &Velocity)>,
 ) {
     // Wait for physics to initialize
     if state.frames_before_spawn > 0 {
@@ -581,6 +819,8 @@ fn evolution_system_headless(
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
             tracker.center = spawn_pos;
+            tracker.peak_height = spawn_pos.y;
+            tracker.max_part_speed = 0.0;
 
             if opts.verbose {
                 println!(
@@ -591,17 +831,24 @@ fn evolution_system_headless(
             }
         }
     } else {
-        // Update center of mass tracking
+        // Update center of mass tracking + physics-cheat telemetry
         let mut total_pos = Vec3::ZERO;
         let mut count = 0;
-        for (_, transform) in creature_parts.iter() {
+        for (_, transform, velocity) in creature_parts.iter() {
             total_pos += transform.translation;
             count += 1;
+            let speed = velocity.linvel.length();
+            if speed.is_finite() && speed > tracker.max_part_speed {
+                tracker.max_part_speed = speed;
+            }
         }
         if count > 0 {
             let new_center = total_pos / count as f32;
             if new_center.is_finite() {
                 tracker.center = new_center;
+                if new_center.y > tracker.peak_height {
+                    tracker.peak_height = new_center.y;
+                }
             }
         }
 
@@ -613,6 +860,8 @@ fn evolution_system_headless(
                 state.test_start_position,
                 tracker.center,
                 config.test_duration,
+                tracker.peak_height,
+                tracker.max_part_speed,
             );
 
             let idx = state.current_individual;
@@ -796,6 +1045,9 @@ fn spawn_part_headless(
         Collider::cuboid(dims.x / 2.0, dims.y / 2.0, dims.z / 2.0),
         ColliderMassProperties::Mass(node.volume()),
         CollisionGroups::new(creature_group, ground_group),
+        // Velocity is written back by Rapier each step; we read it to detect
+        // physics-cheat creatures (solver-energy-leak vibration, launches).
+        Velocity::default(),
         CreaturePart {
             creature_id,
             node_id,

@@ -241,11 +241,13 @@ fn get_input_value(
 
 /// System to run all creature brains
 fn run_brains(
-    time: Res<Time>,
     mut brains: Query<(Entity, &mut Brain, &CreatureBody)>,
     mut parts_query: Query<(&CreaturePart, &mut ImpulseJoint, &GlobalTransform, &Velocity)>,
 ) {
-    let dt = time.delta_secs();
+    // Step on the same fixed dt as physics so oscillators and temporal neurons
+    // stay in lockstep with the simulation, deterministically and independent
+    // of real frame rate.
+    let dt = crate::SIM_DT;
 
     for (creature_entity, mut brain, body) in brains.iter_mut() {
         brain.time += dt;

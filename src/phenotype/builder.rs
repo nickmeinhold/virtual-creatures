@@ -254,6 +254,8 @@ impl PhenotypeBuilder {
             ColliderMassProperties::Mass(info.node.volume()),
             // Collision groups: creature parts belong to GROUP_1, filter to collide only with GROUP_2 (ground)
             CollisionGroups::new(creature_group, ground_group),
+            // Velocity is written back by Rapier each step; read for cheat detection.
+            Velocity::default(),
             CreaturePart {
                 creature_id: info.creature_id,
                 node_id: info.node_id,

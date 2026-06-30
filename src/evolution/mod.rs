@@ -10,8 +10,50 @@
 use bevy::prelude::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use crate::genotype::*;
+
+/// Tunables read once from the environment so we can sweep evolution regimes
+/// without recompiling. Lets a single binary run several configs in parallel.
+pub struct Tuning {
+    /// Hard cap on distinct morphology nodes (part-types). Higher = wilder,
+    /// more complex bodies become reachable.
+    pub max_nodes: usize,
+    /// Multiplier on the structural (add-part) mutation probability. >1 pushes
+    /// against the 1/sqrt(complexity) damping so bodies actually grow.
+    pub struct_boost: f64,
+}
+
+// Parse an env override, warning loudly on a malformed value rather than
+// silently running the default — a typo'd sweep config should not quietly run
+// the wrong experiment.
+fn env_f64(key: &str, default: f64) -> f64 {
+    match std::env::var(key) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("WARNING: {key}='{v}' is not a valid number; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+fn env_usize(key: &str, default: usize) -> usize {
+    match std::env::var(key) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("WARNING: {key}='{v}' is not a valid integer; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+pub fn tuning() -> &'static Tuning {
+    static T: OnceLock<Tuning> = OnceLock::new();
+    T.get_or_init(|| Tuning {
+        max_nodes: env_usize("VC_MAXNODES", 6),
+        struct_boost: env_f64("VC_ADDPART", 1.0),
+    })
+}
 
 /// Configuration for evolution
 #[derive(Resource, Clone)]
@@ -31,10 +73,13 @@ pub struct EvolutionConfig {
 impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
-            population_size: 20,
+            // Larger population sustains many NEAT species at once, which both
+            // escapes the slow-shuffle local optimum (more parallel exploration)
+            // and fills more gallery slots (one champion is archived per species).
+            population_size: env_usize("VC_POP", 100),
             asexual_prob: 0.4,
             crossover_prob: 0.3,
-            mutation_rate: 0.3,
+            mutation_rate: env_f64("VC_MUT", 0.3) as f32,
             test_duration: 10.0,
         }
     }
@@ -90,8 +135,8 @@ impl Default for SpeciationConfig {
             // With ~5-12 genes per creature and disjoint_coeff=1.0, the
             // disjoint term alone typically ranges 0.1-0.8, so 0.5 ensures
             // creatures with meaningfully different topologies get separated.
-            compatibility_threshold: 0.5,
-            stagnation_limit: 15,
+            compatibility_threshold: env_f64("VC_COMPAT", 0.5) as f32,
+            stagnation_limit: env_usize("VC_STAGNATION", 15),
             disjoint_inherit_prob: 0.3,
         }
     }
@@ -314,7 +359,8 @@ impl Default for EvolutionState {
             test_start_time: 0.0,
             test_start_position: Vec3::ZERO,
             archive: Some(CreatureArchive::new()),
-            save_path: Some("creatures.json".to_string()),
+            // Env-overridable so parallel sweep runs don't clobber each other.
+            save_path: Some(std::env::var("VC_OUT").unwrap_or_else(|_| "creatures.json".to_string())),
             frames_before_spawn: 2,
             innovation_counter: InnovationCounter::new(),
             species: Vec::new(),
@@ -590,8 +636,11 @@ pub fn mutate(genotype: &mut CreatureGenotype, rng: &mut impl Rng, rate: f32, co
         mutate_connection(&mut conn.data, rng, adjusted_rate);
     }
 
-    // Maybe add a new part (new gene = new innovation ID)
-    if rng.gen_bool((adjusted_rate * 0.2) as f64) && genotype.morphology.node_count() < 6 {
+    // Maybe add a new part (new gene = new innovation ID). The structural boost
+    // pushes against the 1/sqrt(complexity) damping so bodies can actually grow,
+    // and the node cap is env-tunable to allow wilder morphologies.
+    let add_part_prob = ((adjusted_rate as f64) * 0.2 * tuning().struct_boost).clamp(0.0, 1.0);
+    if rng.gen_bool(add_part_prob) && genotype.morphology.node_count() < tuning().max_nodes {
         let parents: Vec<_> = genotype.morphology.nodes().map(|(id, _)| id).collect();
         if let Some(&parent) = parents.choose(rng) {
             // Validate the parent node exists before adding part
@@ -840,12 +889,39 @@ pub fn graft(
 // ============================================================================
 
 /// Calculate fitness based on distance traveled
-pub fn calculate_fitness(start_pos: Vec3, end_pos: Vec3, duration: f32) -> f32 {
+pub fn calculate_fitness(
+    start_pos: Vec3,
+    end_pos: Vec3,
+    duration: f32,
+    peak_height: f32,
+    max_part_speed: f32,
+) -> f32 {
+    // --- Physics-cheat disqualifiers -------------------------------------
+    // A creature that exploits the solver (vibration energy-leak, launches)
+    // isn't locomoting — it's a glitch, and a glitch in the gallery looks fake.
+    // Disqualify outright (fitness 0) so it can't out-reproduce honest gaits.
+
+    // 1. Solver-energy-leak / explosion: no legitimate gait whips a body part
+    //    faster than this. Vibration exploits spike well past it.
+    const MAX_PLAUSIBLE_PART_SPEED: f32 = 25.0; // m/s
+    if !max_part_speed.is_finite() || max_part_speed > MAX_PLAUSIBLE_PART_SPEED {
+        return 0.0;
+    }
+
+    // 2. Ballistic launch: anything that flings its center of mass this high
+    //    is a projectile, not a walker — catch it even if it lands low again
+    //    (which the end-of-run height check below would miss).
+    const MAX_PLAUSIBLE_PEAK_HEIGHT: f32 = 5.0; // metres
+    if !peak_height.is_finite() || peak_height > MAX_PLAUSIBLE_PEAK_HEIGHT {
+        return 0.0;
+    }
+
+    // --- Honest locomotion score -----------------------------------------
     // Horizontal distance traveled in any direction (ignore Y to avoid rewarding falling)
     let horizontal_dist = Vec2::new(end_pos.x - start_pos.x, end_pos.z - start_pos.z).length();
 
-    // Penalize creatures that fly too high — if the center of mass is above
-    // this threshold, they're exploiting physics, not locomoting.
+    // Soft penalty for finishing airborne (in case it ends mid-hop just under
+    // the hard cap above).
     let max_reasonable_height = 3.0;
     let height_penalty = (end_pos.y - max_reasonable_height).max(0.0);
 
@@ -1079,24 +1155,44 @@ pub fn evolve_generation(state: &mut EvolutionState, config: &EvolutionConfig) {
 
     if let Some(ref best) = global_best {
         state.best_fitness = best.fitness;
+    }
 
-        // Add to archive if enabled
-        if let Some(ref mut archive) = state.archive {
-            let part_count = count_spawned_parts(&best.genotype);
+    // Archive the champion of each species — one entry per distinct lineage —
+    // so the saved gallery is behaviorally diverse rather than 10 near-clones
+    // of whatever moves fastest. Read raw fitness here, BEFORE fitness sharing
+    // (below) rescales it.
+    if let Some(ref mut archive) = state.archive {
+        for s in &state.species {
+            // Champion = highest raw-fitness member of this species.
+            let champion = s.members.iter()
+                .map(|&idx| &state.population[idx])
+                .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
 
-            let saved = SavedCreature::new(
-                best.genotype.clone(),
-                best.fitness,
-                state.generation,
-                part_count,
-            );
-            archive.add(saved);
-            archive.keep_best(10);
+            if let Some(champ) = champion {
+                // Only archive lineages that actually do something — keeps
+                // the barely-moving blobs out of the gallery. (Honest gaits
+                // start slow now that physics-cheats are disqualified.)
+                if champ.fitness < 0.04 { continue; }
 
-            if let Some(ref path) = state.save_path {
-                if let Err(e) = archive.save(path) {
-                    eprintln!("Warning: Failed to save creatures: {}", e);
-                }
+                let part_count = count_spawned_parts(&champ.genotype);
+                let saved = SavedCreature::new(
+                    champ.genotype.clone(),
+                    champ.fitness,
+                    state.generation,
+                    part_count,
+                    s.id,
+                );
+                archive.upsert_species_champion(saved);
+            }
+        }
+
+        // Cap to the strongest distinct lineages so the file stays manageable;
+        // every survivor is still a different species, so diversity is kept.
+        archive.keep_best(24);
+
+        if let Some(ref path) = state.save_path {
+            if let Err(e) = archive.save(path) {
+                eprintln!("Warning: Failed to save creatures: {}", e);
             }
         }
     }
