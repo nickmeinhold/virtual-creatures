@@ -398,12 +398,15 @@ fn export_system(
             let baked = std::mem::take(&mut state.baked);
             let n = baked.len();
             let gallery = export::WebMultiGallery::assemble(state.fps, &state.objectives_meta, baked);
-            if let Err(e) = gallery.save(&state.out_path) {
+            // Split for lazy loading: a tiny manifest at out_path + one data file
+            // per objective alongside it. The viewer loads the manifest first,
+            // then fetches only the objective being watched.
+            if let Err(e) = gallery.save_split(&state.out_path) {
                 eprintln!("Failed to write {}: {}", state.out_path, e);
                 std::process::exit(1);
             }
             println!(
-                "Wrote {} creatures across {} objective(s) to '{}'.",
+                "Wrote {} creatures across {} objective(s): manifest '{}' + one file per objective.",
                 n,
                 gallery.objectives.len(),
                 state.out_path

@@ -111,4 +111,58 @@ impl WebMultiGallery {
         let json = serde_json::to_string(self).map_err(io::Error::other)?;
         fs::write(path, json)
     }
+
+    /// Save split for lazy loading: one file per objective (with all its frames)
+    /// plus a tiny manifest at `manifest_path` listing each objective's metadata
+    /// and file. The web viewer fetches the manifest first (instant — no frames)
+    /// then lazy-loads only the objective being viewed.
+    ///
+    /// Per-objective files are written next to the manifest, named
+    /// `<manifest-stem>-<key>.json`, and the manifest references them by bare
+    /// filename so they resolve relative to wherever the manifest is served.
+    pub fn save_split<P: AsRef<Path>>(&self, manifest_path: P) -> io::Result<()> {
+        let manifest_path = manifest_path.as_ref();
+        let dir = manifest_path.parent().unwrap_or_else(|| Path::new(""));
+        let stem = manifest_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("creatures-web");
+
+        let mut refs = Vec::with_capacity(self.objectives.len());
+        for obj in &self.objectives {
+            let file = format!("{stem}-{}.json", obj.key);
+            let json = serde_json::to_string(obj).map_err(io::Error::other)?;
+            fs::write(dir.join(&file), json)?;
+            refs.push(WebObjectiveRef {
+                key: obj.key.clone(),
+                label: obj.label.clone(),
+                unit: obj.unit.clone(),
+                fps: obj.fps,
+                file,
+            });
+        }
+
+        let manifest = WebManifest { objectives: refs };
+        let json = serde_json::to_string(&manifest).map_err(io::Error::other)?;
+        fs::write(manifest_path, json)
+    }
+}
+
+/// One objective's entry in the lazy-load manifest: metadata plus the file that
+/// holds its (heavy) per-generation pose data. No frames here — that's the point.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebObjectiveRef {
+    pub key: String,
+    pub label: String,
+    pub unit: String,
+    pub fps: u32,
+    /// Bare filename of this objective's data file, resolved relative to the
+    /// manifest's own URL.
+    pub file: String,
+}
+
+/// The lazy-load manifest written to disk as the top-level `creatures-web.json`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebManifest {
+    pub objectives: Vec<WebObjectiveRef>,
 }
