@@ -917,7 +917,6 @@ pub fn graft(
 // Fitness Evaluation
 // ============================================================================
 
-/// Calculate fitness based on distance traveled
 /// Per-run telemetry feeding the objective-specific fitness functions. All
 /// height/spin fields are measured AFTER the creature settles from its spawn
 /// drop (see CreatureTracker), so they reflect behaviour, not the initial fall.
@@ -932,9 +931,11 @@ pub struct FitnessInputs {
     pub settle_com_height: f32,
     /// Peak height of the single highest part (post-settle).
     pub peak_part_height: f32,
-    /// Highest the creature's LOWEST part ever rose — a grounded tower keeps
-    /// this near zero; a jump lifts every part off, spiking it.
+    /// Highest the creature's LOWEST part ever rose (post-settle).
     pub min_part_floor: f32,
+    /// Lowest-part height at the settle point — reach measures the RISE of the
+    /// feet above this (size-independent), not an absolute floor.
+    pub settle_floor: f32,
     /// Fastest linear part speed (m/s) over the whole run (cheat guard).
     pub max_part_speed: f32,
     /// Fastest angular part speed (rad/s) over the whole run (cheat guard).
@@ -972,17 +973,23 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
             (f.peak_com_height - f.settle_com_height).max(0.0)
         }
         FitnessMode::Spin => {
-            // Angular solver-explosion guard, then reward sustained rotation.
+            // Angular solver-explosion guard (now measured post-settle, so the
+            // spawn tumble can't disqualify a legit spinner), then reward
+            // rotation per ACTIVE second (excluding the settle window).
             if !f.max_angspeed.is_finite() || f.max_angspeed > 40.0 {
                 return 0.0;
             }
-            (f.total_spin / f.duration.max(1.0)).max(0.0)
+            let active = (f.duration - crate::SETTLE_SECS).max(1.0);
+            (f.total_spin / active).max(0.0)
         }
         FitnessMode::Reach => {
-            // A tower, not a jump: if the lowest part left the ground, it hopped
-            // rather than reached — disqualify. Otherwise reward the absolute
-            // height the highest part holds (taller body / unfolding upward).
-            if !f.min_part_floor.is_finite() || f.min_part_floor > 0.6 {
+            // A tower, not a jump: disqualify only if the lowest part RISES
+            // meaningfully above where it settled — size-independent, so a
+            // tall-but-grounded body (whose feet rest above an absolute 0.6)
+            // isn't wrongly rejected. Reward the absolute height of the top part.
+            if !f.min_part_floor.is_finite()
+                || f.min_part_floor - f.settle_floor > 0.5
+            {
                 return 0.0;
             }
             f.peak_part_height.max(0.0)

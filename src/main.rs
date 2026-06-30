@@ -552,6 +552,10 @@ struct CreatureTracker {
     peak_part_height: f32,
     /// Highest the LOWEST part ever rose (post-settle) — grounded check for reach.
     min_part_floor: f32,
+    /// Lowest-part height captured at the settle point — reach's grounded
+    /// baseline, so the check is "did the feet rise" (size-independent) rather
+    /// than an absolute floor that disqualifies tall-but-grounded towers.
+    settle_floor: f32,
     /// Centre-of-mass height captured at the settle point — jump's resting baseline.
     settle_com: f32,
     /// Fastest single part speed (linear, m/s) over the run — universal cheat guard.
@@ -571,6 +575,7 @@ impl CreatureTracker {
         self.peak_height = spawn_pos.y;
         self.peak_part_height = spawn_pos.y;
         self.min_part_floor = spawn_pos.y;
+        self.settle_floor = spawn_pos.y;
         self.settle_com = spawn_pos.y;
         self.max_part_speed = 0.0;
         self.max_angspeed = 0.0;
@@ -588,6 +593,7 @@ impl CreatureTracker {
             settle_com_height: self.settle_com,
             peak_part_height: self.peak_part_height,
             min_part_floor: self.min_part_floor,
+            settle_floor: self.settle_floor,
             max_part_speed: self.max_part_speed,
             max_angspeed: self.max_angspeed,
             total_spin: self.total_spin,
@@ -644,7 +650,14 @@ fn accumulate_telemetry(
             tracker.settle_com = com.y;
             tracker.peak_part_height = frame_max_y;
             tracker.min_part_floor = frame_min_y;
+            tracker.settle_floor = frame_min_y;
             tracker.total_spin = 0.0;
+            // Reset the cheat guards too, so the spawn-drop landing impact can't
+            // disqualify a creature for a transient it never intended. Real
+            // solver-vibration exploits are sustained and show up post-settle;
+            // NaN/explosion is still caught by the is_finite filters every frame.
+            tracker.max_part_speed = 0.0;
+            tracker.max_angspeed = 0.0;
             tracker.settled = true;
         }
         return;
