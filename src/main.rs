@@ -537,16 +537,122 @@ fn replay_system(
 #[derive(Component)]
 struct TestCreature;
 
-/// Resource to track creature's center of mass and physics-cheat telemetry
+/// Resource to track creature's center of mass and per-objective telemetry.
+/// Height/spin fields are reset once at `settled` so they measure behaviour,
+/// not the initial spawn drop.
 #[derive(Resource, Default)]
 struct CreatureTracker {
     center: Vec3,
-    /// Highest center-of-mass Y reached during the run (catches launchers that
-    /// fly across and land low, which the end-of-run height penalty misses).
+    /// Highest center-of-mass Y reached (post-settle) — distance launch guard,
+    /// jump reward.
     peak_height: f32,
-    /// Fastest single part speed (linear, m/s) seen during the run. A legit
-    /// gait stays modest; solver-exploit vibration spikes this.
+    /// Highest Y any single part reaches (post-settle) — reach reward.
+    peak_part_height: f32,
+    /// Highest the LOWEST part ever rose (post-settle) — grounded check for reach.
+    min_part_floor: f32,
+    /// Centre-of-mass height captured at the settle point — jump's resting baseline.
+    settle_com: f32,
+    /// Fastest single part speed (linear, m/s) over the run — universal cheat guard.
     max_part_speed: f32,
+    /// Fastest single part angular speed (rad/s) over the run — spin cheat guard.
+    max_angspeed: f32,
+    /// Accumulated mean angular motion (radians, post-settle) — spin reward.
+    total_spin: f32,
+    /// Whether the post-spawn settle reset has happened yet this run.
+    settled: bool,
+}
+
+impl CreatureTracker {
+    /// Clear all telemetry for a fresh creature spawning at `spawn_pos`.
+    fn reset(&mut self, spawn_pos: Vec3) {
+        self.center = spawn_pos;
+        self.peak_height = spawn_pos.y;
+        self.peak_part_height = spawn_pos.y;
+        self.min_part_floor = spawn_pos.y;
+        self.settle_com = spawn_pos.y;
+        self.max_part_speed = 0.0;
+        self.max_angspeed = 0.0;
+        self.total_spin = 0.0;
+        self.settled = false;
+    }
+
+    /// Snapshot the telemetry into the objective-agnostic fitness inputs.
+    fn fitness_inputs(&self, start_pos: Vec3, duration: f32) -> FitnessInputs {
+        FitnessInputs {
+            start_pos,
+            end_pos: self.center,
+            duration,
+            peak_com_height: self.peak_height,
+            settle_com_height: self.settle_com,
+            peak_part_height: self.peak_part_height,
+            min_part_floor: self.min_part_floor,
+            max_part_speed: self.max_part_speed,
+            max_angspeed: self.max_angspeed,
+            total_spin: self.total_spin,
+        }
+    }
+}
+
+/// Seconds to let a creature drop and settle before height/spin telemetry
+/// starts — otherwise the spawn fall pollutes every height-based objective.
+const SETTLE_SECS: f32 = 1.0;
+
+/// Fold one frame of part state into the tracker: centre of mass, the linear
+/// and angular cheat-guard peaks (tracked from spawn), and — once settled — the
+/// per-objective behaviour peaks. `elapsed` is seconds since this run's start.
+fn accumulate_telemetry(
+    tracker: &mut CreatureTracker,
+    parts: &Query<(&CreaturePart, &Transform, &Velocity)>,
+    elapsed: f32,
+) {
+    let mut total_pos = Vec3::ZERO;
+    let mut count = 0u32;
+    let mut frame_min_y = f32::INFINITY;
+    let mut frame_max_y = f32::NEG_INFINITY;
+    let mut sum_angspeed = 0.0;
+    for (_, tf, vel) in parts.iter() {
+        total_pos += tf.translation;
+        count += 1;
+        frame_min_y = frame_min_y.min(tf.translation.y);
+        frame_max_y = frame_max_y.max(tf.translation.y);
+        let lin = vel.linvel.length();
+        if lin.is_finite() && lin > tracker.max_part_speed {
+            tracker.max_part_speed = lin;
+        }
+        let ang = vel.angvel.length();
+        if ang.is_finite() && ang > tracker.max_angspeed {
+            tracker.max_angspeed = ang;
+        }
+        sum_angspeed += ang;
+    }
+    if count == 0 {
+        return;
+    }
+    let com = total_pos / count as f32;
+    if com.is_finite() {
+        tracker.center = com;
+    }
+    let mean_angspeed = sum_angspeed / count as f32;
+
+    if !tracker.settled {
+        // Re-baseline the behaviour peaks the moment the creature has settled,
+        // then start accumulating against that baseline.
+        if elapsed >= SETTLE_SECS {
+            tracker.peak_height = com.y;
+            tracker.settle_com = com.y;
+            tracker.peak_part_height = frame_max_y;
+            tracker.min_part_floor = frame_min_y;
+            tracker.total_spin = 0.0;
+            tracker.settled = true;
+        }
+        return;
+    }
+    tracker.peak_height = tracker.peak_height.max(com.y);
+    tracker.peak_part_height = tracker.peak_part_height.max(frame_max_y);
+    tracker.min_part_floor = tracker.min_part_floor.max(frame_min_y);
+    if mean_angspeed.is_finite() {
+        tracker.total_spin += mean_angspeed * SIM_DT;
+    }
 }
 
 /// Simulated elapsed time for headless mode
@@ -683,9 +789,7 @@ fn evolution_system(
 
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
-            tracker.center = spawn_pos;
-            tracker.peak_height = spawn_pos.y;
-            tracker.max_part_speed = 0.0;
+            tracker.reset(spawn_pos);
 
             if opts.verbose {
                 println!(
@@ -701,38 +805,14 @@ fn evolution_system(
             }
         }
     } else {
-        // Update center of mass tracking + physics-cheat telemetry
-        let mut total_pos = Vec3::ZERO;
-        let mut count = 0;
-        for (_, transform, velocity) in creature_parts.iter() {
-            total_pos += transform.translation;
-            count += 1;
-            let speed = velocity.linvel.length();
-            if speed.is_finite() && speed > tracker.max_part_speed {
-                tracker.max_part_speed = speed;
-            }
-        }
-        if count > 0 {
-            let new_center = total_pos / count as f32;
-            if new_center.is_finite() {
-                tracker.center = new_center;
-                if new_center.y > tracker.peak_height {
-                    tracker.peak_height = new_center.y;
-                }
-            }
-        }
+        let elapsed = current_time - state.test_start_time;
+        accumulate_telemetry(&mut tracker, &creature_parts, elapsed);
 
         // Check if test duration elapsed or space pressed to skip
-        let elapsed = current_time - state.test_start_time;
         let skip_pressed = keyboard.just_pressed(KeyCode::Space);
         if elapsed >= config.test_duration || skip_pressed {
-            // Calculate fitness
             let fitness = calculate_fitness(
-                state.test_start_position,
-                tracker.center,
-                config.test_duration,
-                tracker.peak_height,
-                tracker.max_part_speed,
+                &tracker.fitness_inputs(state.test_start_position, config.test_duration),
             );
 
             let idx = state.current_individual;
@@ -818,9 +898,7 @@ fn evolution_system_headless(
 
             state.test_start_time = current_time;
             state.test_start_position = spawn_pos;
-            tracker.center = spawn_pos;
-            tracker.peak_height = spawn_pos.y;
-            tracker.max_part_speed = 0.0;
+            tracker.reset(spawn_pos);
 
             if opts.verbose {
                 println!(
@@ -831,37 +909,13 @@ fn evolution_system_headless(
             }
         }
     } else {
-        // Update center of mass tracking + physics-cheat telemetry
-        let mut total_pos = Vec3::ZERO;
-        let mut count = 0;
-        for (_, transform, velocity) in creature_parts.iter() {
-            total_pos += transform.translation;
-            count += 1;
-            let speed = velocity.linvel.length();
-            if speed.is_finite() && speed > tracker.max_part_speed {
-                tracker.max_part_speed = speed;
-            }
-        }
-        if count > 0 {
-            let new_center = total_pos / count as f32;
-            if new_center.is_finite() {
-                tracker.center = new_center;
-                if new_center.y > tracker.peak_height {
-                    tracker.peak_height = new_center.y;
-                }
-            }
-        }
+        let elapsed = current_time - state.test_start_time;
+        accumulate_telemetry(&mut tracker, &creature_parts, elapsed);
 
         // Check if test duration elapsed
-        let elapsed = current_time - state.test_start_time;
         if elapsed >= config.test_duration {
-            // Calculate fitness
             let fitness = calculate_fitness(
-                state.test_start_position,
-                tracker.center,
-                config.test_duration,
-                tracker.peak_height,
-                tracker.max_part_speed,
+                &tracker.fitness_inputs(state.test_start_position, config.test_duration),
             );
 
             let idx = state.current_individual;
