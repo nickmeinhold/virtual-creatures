@@ -55,6 +55,35 @@ pub fn tuning() -> &'static Tuning {
     })
 }
 
+/// What a population is selected for. Each variant is a distinct fitness
+/// function with its own telemetry and its own cheat guards — selected via the
+/// `VC_FITNESS` env var so one binary can evolve every objective.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FitnessMode {
+    /// Horizontal distance travelled (locomotion speed).
+    Distance,
+    /// Peak height the centre of mass reaches (jumping).
+    Jump,
+    /// Accumulated angular motion (spinning / tumbling).
+    Spin,
+    /// Highest a part reaches while the body stays grounded (towers).
+    Reach,
+}
+
+pub fn fitness_mode() -> FitnessMode {
+    static M: OnceLock<FitnessMode> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("VC_FITNESS").as_deref() {
+        Ok("jump") => FitnessMode::Jump,
+        Ok("spin") => FitnessMode::Spin,
+        Ok("reach") => FitnessMode::Reach,
+        Ok("distance") | Err(_) => FitnessMode::Distance,
+        Ok(other) => {
+            eprintln!("WARNING: VC_FITNESS='{other}' unknown; using 'distance'");
+            FitnessMode::Distance
+        }
+    })
+}
+
 /// Configuration for evolution
 #[derive(Resource, Clone)]
 pub struct EvolutionConfig {
@@ -888,46 +917,84 @@ pub fn graft(
 // Fitness Evaluation
 // ============================================================================
 
-/// Calculate fitness based on distance traveled
-pub fn calculate_fitness(
-    start_pos: Vec3,
-    end_pos: Vec3,
-    duration: f32,
-    peak_height: f32,
-    max_part_speed: f32,
-) -> f32 {
-    // --- Physics-cheat disqualifiers -------------------------------------
-    // A creature that exploits the solver (vibration energy-leak, launches)
-    // isn't locomoting — it's a glitch, and a glitch in the gallery looks fake.
-    // Disqualify outright (fitness 0) so it can't out-reproduce honest gaits.
+/// Per-run telemetry feeding the objective-specific fitness functions. All
+/// height/spin fields are measured AFTER the creature settles from its spawn
+/// drop (see CreatureTracker), so they reflect behaviour, not the initial fall.
+pub struct FitnessInputs {
+    pub start_pos: Vec3,
+    pub end_pos: Vec3,
+    pub duration: f32,
+    /// Peak centre-of-mass height (post-settle).
+    pub peak_com_height: f32,
+    /// Centre-of-mass height at the settle point — the resting baseline a jump
+    /// is measured against (so static tallness isn't mistaken for jumping).
+    pub settle_com_height: f32,
+    /// Peak height of the single highest part (post-settle).
+    pub peak_part_height: f32,
+    /// Highest the creature's LOWEST part ever rose (post-settle).
+    pub min_part_floor: f32,
+    /// Lowest-part height at the settle point — reach measures the RISE of the
+    /// feet above this (size-independent), not an absolute floor.
+    pub settle_floor: f32,
+    /// Fastest linear part speed (m/s) over the whole run (cheat guard).
+    pub max_part_speed: f32,
+    /// Fastest angular part speed (rad/s) over the whole run (cheat guard).
+    pub max_angspeed: f32,
+    /// Accumulated mean angular motion (radians) post-settle (spin reward).
+    pub total_spin: f32,
+}
 
-    // 1. Solver-energy-leak / explosion: no legitimate gait whips a body part
-    //    faster than this. Vibration exploits spike well past it.
-    const MAX_PLAUSIBLE_PART_SPEED: f32 = 25.0; // m/s
-    if !max_part_speed.is_finite() || max_part_speed > MAX_PLAUSIBLE_PART_SPEED {
+/// Objective-dispatched fitness. Every mode shares the linear solver-fling guard
+/// (no honest gait whips a part past 25 m/s); the rest is per-objective.
+pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
+    // Universal cheat guard: solver-energy-leak vibration flings a part absurdly
+    // fast in ANY objective. Disqualify outright.
+    const MAX_PART_SPEED: f32 = 25.0; // m/s
+    if !f.max_part_speed.is_finite() || f.max_part_speed > MAX_PART_SPEED {
         return 0.0;
     }
 
-    // 2. Ballistic launch: anything that flings its center of mass this high
-    //    is a projectile, not a walker — catch it even if it lands low again
-    //    (which the end-of-run height check below would miss).
-    const MAX_PLAUSIBLE_PEAK_HEIGHT: f32 = 5.0; // metres
-    if !peak_height.is_finite() || peak_height > MAX_PLAUSIBLE_PEAK_HEIGHT {
-        return 0.0;
+    match fitness_mode() {
+        FitnessMode::Distance => {
+            // Ballistic-launch guard: a walker that flies isn't locomoting.
+            if !f.peak_com_height.is_finite() || f.peak_com_height > 5.0 {
+                return 0.0;
+            }
+            let horizontal = Vec2::new(f.end_pos.x - f.start_pos.x, f.end_pos.z - f.start_pos.z).length();
+            (horizontal / f.duration.max(1.0)).max(0.0)
+        }
+        FitnessMode::Jump => {
+            // Reward how far the COM rises above its RESTING height — a real hop,
+            // not static tallness. Disqualify absurd launches (solver fling that
+            // slips under the speed cap).
+            if !f.peak_com_height.is_finite() || f.peak_com_height > 20.0 {
+                return 0.0;
+            }
+            (f.peak_com_height - f.settle_com_height).max(0.0)
+        }
+        FitnessMode::Spin => {
+            // Angular solver-explosion guard (now measured post-settle, so the
+            // spawn tumble can't disqualify a legit spinner), then reward
+            // rotation per ACTIVE second (excluding the settle window).
+            if !f.max_angspeed.is_finite() || f.max_angspeed > 40.0 {
+                return 0.0;
+            }
+            let active = (f.duration - crate::SETTLE_SECS).max(1.0);
+            (f.total_spin / active).max(0.0)
+        }
+        FitnessMode::Reach => {
+            // A tower, not a jump: disqualify only if the lowest part RISES
+            // meaningfully above where it settled — size-independent, so a
+            // tall-but-grounded body (whose feet rest above an absolute 0.6)
+            // isn't wrongly rejected. Reward the absolute height of the top part.
+            if !f.min_part_floor.is_finite()
+                || f.min_part_floor - f.settle_floor > 0.5
+            {
+                return 0.0;
+            }
+            f.peak_part_height.max(0.0)
+        }
     }
-
-    // --- Honest locomotion score -----------------------------------------
-    // Horizontal distance traveled in any direction (ignore Y to avoid rewarding falling)
-    let horizontal_dist = Vec2::new(end_pos.x - start_pos.x, end_pos.z - start_pos.z).length();
-
-    // Soft penalty for finishing airborne (in case it ends mid-hop just under
-    // the hard cap above).
-    let max_reasonable_height = 3.0;
-    let height_penalty = (end_pos.y - max_reasonable_height).max(0.0);
-
-    // Normalize by time to get speed, then subtract height penalty
-    let speed = horizontal_dist / duration.max(1.0);
-    (speed - height_penalty).max(0.0)
 }
 
 // ============================================================================
