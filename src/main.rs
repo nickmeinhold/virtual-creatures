@@ -220,7 +220,10 @@ struct ExportState {
     part_dims: Vec<[f32; 3]>,
     /// Accumulated poses: frames[f][p].
     frames: Vec<Vec<[f32; 7]>>,
-    /// Sim time at which recording for the current creature began.
+    /// Sim time the current creature's parts first became queryable (start of
+    /// the settle window). Recording begins `SETTLE_SECS` after this.
+    settle_time: Option<f32>,
+    /// Sim time at which recording for the current creature began (post-settle).
     start_time: Option<f32>,
 }
 
@@ -363,6 +366,7 @@ fn run_export_jobs(
         part_entities: Vec::new(),
         part_dims: Vec::new(),
         frames: Vec::new(),
+        settle_time: None,
         start_time: None,
     });
     app.insert_resource(FIXED_TIMESTEP);
@@ -426,13 +430,14 @@ fn export_system(
         state.part_dims = spawned.parts.iter().map(|_| [0.0; 3]).collect();
         state.part_entities = spawned.parts.clone();
         state.frames.clear();
+        state.settle_time = None;
         state.start_time = None;
         return;
     }
 
-    // Lazily fill dims the first tick the parts are queryable, and anchor the
-    // recording clock to that moment.
-    if state.start_time.is_none() {
+    // Lazily fill dims the first tick the parts are queryable, and start the
+    // settle clock from that moment.
+    if state.settle_time.is_none() {
         let genotype = state.jobs[state.current_index].genotype.clone();
         let entities = state.part_entities.clone();
         let mut dims = vec![[0.0f32; 3]; entities.len()];
@@ -445,7 +450,18 @@ fn export_system(
             }
         }
         state.part_dims = dims;
-        state.start_time = Some(t);
+        state.settle_time = Some(t);
+    }
+
+    // Let the creature settle from its 2m spawn drop (and the brain warm up)
+    // before recording, so the gallery shows the EVOLVED behaviour — the same
+    // post-settle window the fitness function scores — not a second of falling.
+    if state.start_time.is_none() {
+        if t - state.settle_time.unwrap() >= SETTLE_SECS {
+            state.start_time = Some(t);
+        } else {
+            return; // still settling — don't record this frame
+        }
     }
 
     let local = t - state.start_time.unwrap();
