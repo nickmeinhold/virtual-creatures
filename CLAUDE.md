@@ -74,16 +74,33 @@ Evolution (select top 20%, mutate, crossover, graft)
 
 ## Configuration
 
-Edit `EvolutionConfig` in `src/evolution/mod.rs`:
+Edit `EvolutionConfig` in `src/evolution/mod.rs` (several fields read env-var
+overrides, shown below):
 ```rust
 EvolutionConfig {
-    population_size: 20,
+    population_size: 100,     // VC_POP
     asexual_prob: 0.4,
     crossover_prob: 0.3,
     mutation_rate: 0.3,
     test_duration: 10.0,      // Seconds per creature
 }
 ```
+
+### Useful env vars
+
+- `VC_FITNESS` — objective to evolve: `distance` (default), `jump`, `spin`, `reach`.
+- `VC_POP` — population size (default 100).
+- `VC_OUT` — hall-of-fame archive path (default `creatures.json`).
+- `VC_HISTORY` — if set, also record per-generation history to this path
+  (the web gallery's evolution timeline is baked from these).
+- `VC_MAX_GEN` — stop cleanly after N generations (for bounded bake runs).
+
+### Web gallery export
+
+- `--export` bakes `creatures.json` into `creatures-web.json` (single objective).
+- `--export-history` bakes the four `history-<objective>.json` files into one
+  multi-objective, generation-indexed `creatures-web.json` the site replays.
+  Run each objective with `VC_FITNESS`/`VC_HISTORY` set, then export once.
 
 Speciation is configured separately via `SpeciationConfig` (compatibility threshold, stagnation limit, etc.).
 
