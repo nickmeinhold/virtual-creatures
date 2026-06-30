@@ -4,12 +4,27 @@ use std::env;
 
 mod brain;
 mod evolution;
+mod export;
 mod genotype;
 mod phenotype;
 
 use brain::{Brain, BrainPlugin};
 use evolution::*;
 use phenotype::*;
+
+/// Fixed simulation timestep (seconds) shared by physics, the brain, and trial
+/// duration accounting. Decoupling the sim from wall-clock time is what lets
+/// headless evolution run as fast as the CPU allows *without* distorting
+/// evaluation: every tick advances physics, brain, and the duration clock by
+/// exactly this much, so a 10 "second" trial is always 600 faithful steps
+/// regardless of how fast the loop spins.
+pub const SIM_DT: f32 = 1.0 / 60.0;
+
+/// Rapier's `TimestepMode` pinned to a fixed per-tick step. Without this the
+/// plugin defaults to `Variable` (steps by real `Time::delta`), which made the
+/// `--speed` multiplier silently judge creatures on a fraction of their
+/// intended physics. Inserted as a resource before the app runs.
+const FIXED_TIMESTEP: TimestepMode = TimestepMode::Fixed { dt: SIM_DT, substeps: 1 };
 
 /// Command-line options for the simulation
 #[derive(Resource, Clone)]
@@ -22,6 +37,8 @@ struct SimulationOptions {
     verbose: bool,
     /// Replay mode: load and watch saved creatures
     replay: Option<String>,
+    /// Export mode: bake saved creatures to a web-playable JSON at this path
+    export: Option<String>,
 }
 
 impl Default for SimulationOptions {
@@ -31,6 +48,7 @@ impl Default for SimulationOptions {
             speed: 1.0,
             verbose: true,
             replay: None,
+            export: None,
         }
     }
 }
@@ -58,6 +76,15 @@ fn parse_args() -> SimulationOptions {
                     opts.replay = Some("creatures.json".to_string());
                 }
             }
+            "--export" | "-e" => {
+                // Optional output path; default creatures-web.json.
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    opts.export = Some(args[i].clone());
+                } else {
+                    opts.export = Some("creatures-web.json".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!("Virtual Creatures Evolution Simulator");
                 println!();
@@ -66,6 +93,7 @@ fn parse_args() -> SimulationOptions {
                 println!("  --speed, -s N     Simulation speed multiplier (default: 1.0)");
                 println!("  --quiet, -q       Reduce output verbosity");
                 println!("  --replay, -r FILE Load and watch saved creatures (default: creatures.json)");
+                println!("  --export, -e FILE Bake creatures.json to web-playable JSON (default: creatures-web.json)");
                 println!("  --help, -h        Show this help message");
                 println!();
                 println!("Examples:");
@@ -85,7 +113,9 @@ fn parse_args() -> SimulationOptions {
 fn main() {
     let opts = parse_args();
 
-    if let Some(ref path) = opts.replay {
+    if let Some(ref out) = opts.export {
+        run_export(opts.clone(), out.clone());
+    } else if let Some(ref path) = opts.replay {
         run_replay(opts.clone(), path.clone());
     } else if opts.headless {
         run_headless(opts);
@@ -130,6 +160,7 @@ fn run_headless(opts: SimulationOptions) {
     app.insert_resource(EvolutionConfig::default());
     app.insert_resource(EvolutionState::default());
     app.insert_resource(SimulationSpeed(speed));
+    app.insert_resource(FIXED_TIMESTEP);
     app.add_systems(Startup, setup_headless);
     app.add_systems(Update, (advance_simulation_time, evolution_system_headless));
 
@@ -137,6 +168,183 @@ fn run_headless(opts: SimulationOptions) {
     println!("Press Ctrl+C to stop\n");
 
     app.run();
+}
+
+/// State for export mode: walk the archive, simulate each creature, and bake
+/// its per-frame poses into a web-playable gallery.
+#[derive(Resource)]
+struct ExportState {
+    archive: genotype::CreatureArchive,
+    out_path: String,
+    fps: u32,
+    /// Seconds of motion to record per creature.
+    duration: f32,
+    current_index: usize,
+    gallery: export::WebGallery,
+    /// Part entities of the creature being recorded, in stable spawn order.
+    part_entities: Vec<Entity>,
+    /// Box dimensions per part (same order as `part_entities`).
+    part_dims: Vec<[f32; 3]>,
+    /// Accumulated poses: frames[f][p].
+    frames: Vec<Vec<[f32; 7]>>,
+    /// Sim time at which recording for the current creature began.
+    start_time: Option<f32>,
+}
+
+fn run_export(opts: SimulationOptions, out_path: String) {
+    let archive = match genotype::CreatureArchive::load("creatures.json") {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error loading creatures.json: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if archive.creatures.is_empty() {
+        eprintln!("No creatures in creatures.json to export.");
+        std::process::exit(1);
+    }
+
+    let fps = 30;
+    let n = archive.creatures.len();
+    println!("Exporting {} creatures to '{}' ({} fps)...", n, out_path, fps);
+
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.add_plugins(bevy::asset::AssetPlugin::default());
+    app.add_plugins(bevy::scene::ScenePlugin);
+    app.init_resource::<Assets<Mesh>>();
+    app.add_plugins(RapierPhysicsPlugin::<NoUserData>::default());
+    app.add_plugins(BrainPlugin);
+    // Record at realtime so physics integrates with full fidelity — a high
+    // speed multiplier would take fewer physics steps per recorded second and
+    // make the baked motion choppy.
+    app.insert_resource(SimulationSpeed(1.0));
+    app.insert_resource(opts);
+    app.insert_resource(SimulatedTime::default());
+    app.insert_resource(ExportState {
+        archive,
+        out_path,
+        fps,
+        duration: 8.0,
+        current_index: 0,
+        gallery: export::WebGallery::new(fps),
+        part_entities: Vec::new(),
+        part_dims: Vec::new(),
+        frames: Vec::new(),
+        start_time: None,
+    });
+    app.insert_resource(FIXED_TIMESTEP);
+    app.add_systems(Startup, setup_export);
+    app.add_systems(Update, (advance_simulation_time, export_system));
+    app.run();
+}
+
+fn setup_export(mut commands: Commands) {
+    // Ground plane (collider only; no mesh needed headless).
+    commands.spawn((
+        Collider::halfspace(Vec3::Y).unwrap(),
+        CollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_system(
+    mut commands: Commands,
+    sim_time: Res<SimulatedTime>,
+    mut state: ResMut<ExportState>,
+    creatures: Query<Entity, With<TestCreature>>,
+    parts_q: Query<(&CreaturePart, &Transform)>,
+) {
+    let t = sim_time.elapsed;
+    let total_frames = (state.duration * state.fps as f32).round() as usize;
+
+    // No creature in the world: either finish, or spawn the next one.
+    if creatures.is_empty() {
+        if state.current_index >= state.archive.creatures.len() {
+            // Done — write the gallery and exit.
+            if let Err(e) = state.gallery.save(&state.out_path) {
+                eprintln!("Failed to write {}: {}", state.out_path, e);
+                std::process::exit(1);
+            }
+            println!(
+                "Wrote {} creatures to '{}'.",
+                state.gallery.creatures.len(),
+                state.out_path
+            );
+            std::process::exit(0);
+        }
+
+        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let spawned = spawn_creature_headless(&mut commands, &genotype, Vec3::new(0.0, 2.0, 0.0));
+        for entity in &spawned.parts {
+            commands.entity(*entity).insert(TestCreature);
+        }
+        commands.entity(spawned.root).insert(TestCreature);
+        commands.entity(spawned.creature_entity).insert(Brain::new(genotype.clone()));
+
+        // Record part dimensions in spawn order so they line up with poses.
+        state.part_dims = spawned.parts.iter().map(|_| [0.0; 3]).collect();
+        state.part_entities = spawned.parts.clone();
+        state.frames.clear();
+        state.start_time = None;
+        return;
+    }
+
+    // Lazily fill dims the first tick the parts are queryable, and anchor the
+    // recording clock to that moment.
+    if state.start_time.is_none() {
+        let genotype = state.archive.creatures[state.current_index].genotype.clone();
+        let entities = state.part_entities.clone();
+        let mut dims = vec![[0.0f32; 3]; entities.len()];
+        for (i, entity) in entities.iter().enumerate() {
+            if let Ok((cp, _)) = parts_q.get(*entity) {
+                if let Some(node) = genotype.morphology.get_node(cp.node_id) {
+                    let d = node.dimensions;
+                    dims[i] = [d.x, d.y, d.z];
+                }
+            }
+        }
+        state.part_dims = dims;
+        state.start_time = Some(t);
+    }
+
+    let local = t - state.start_time.unwrap();
+
+    // Sample one pose whenever the playback grid advances past a new frame.
+    if local >= state.frames.len() as f32 / state.fps as f32 && state.frames.len() < total_frames {
+        let entities = state.part_entities.clone();
+        let mut pose = Vec::with_capacity(entities.len());
+        for entity in &entities {
+            if let Ok((_, tf)) = parts_q.get(*entity) {
+                let p = tf.translation;
+                let q = tf.rotation;
+                pose.push([p.x, p.y, p.z, q.x, q.y, q.z, q.w]);
+            } else {
+                pose.push([0.0; 7]);
+            }
+        }
+        state.frames.push(pose);
+    }
+
+    // Finished recording this creature: stash it and tear down for the next.
+    if state.frames.len() >= total_frames {
+        let id = state.current_index;
+        let (fitness, generation, species_id) = {
+            let saved = &state.archive.creatures[id];
+            (saved.fitness, saved.generation, saved.species_id)
+        };
+        let frames = std::mem::take(&mut state.frames);
+        let parts = state.part_dims.iter().map(|d| export::WebPart { dims: *d }).collect();
+        let web = export::WebCreature { id, fitness, generation, species_id, parts, frames };
+        println!("  baked creature {} (fitness {:.3})", id, fitness);
+        state.gallery.creatures.push(web);
+        state.current_index += 1;
+
+        for entity in creatures.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+    }
 }
 
 /// Resource to track simulation speed
@@ -391,13 +599,12 @@ fn setup_headless(
     commands.insert_resource(SimulatedTime::default());
 }
 
-/// Advance simulation time faster in headless mode
-fn advance_simulation_time(
-    mut sim_time: ResMut<SimulatedTime>,
-    time: Res<Time>,
-    speed: Res<SimulationSpeed>,
-) {
-    sim_time.elapsed += time.delta_secs() * speed.0;
+/// Advance the simulation clock by one fixed step per tick, matching the fixed
+/// physics timestep. The loop runs uncapped headless, so wall-clock speed comes
+/// from how fast ticks fire — not from scaling time, which would desync the
+/// duration clock from the physics the creature actually experiences.
+fn advance_simulation_time(mut sim_time: ResMut<SimulatedTime>) {
+    sim_time.elapsed += SIM_DT;
 }
 
 /// Main evolution system (with graphics)
