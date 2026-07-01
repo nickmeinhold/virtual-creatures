@@ -928,10 +928,16 @@ fn batch_size() -> usize {
     std::env::var("VC_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1)
 }
 
-/// Horizontal spacing between batched creatures. Telemetry is per-creature so
-/// this isn't needed for correctness, but keeping bodies apart avoids any
-/// solver oddity from perfectly coincident transforms.
-const BATCH_SPACING: f32 = 30.0;
+/// Horizontal spacing between batched creatures. Zero: they spawn coincident at
+/// the origin and pass through each other (creatures collide only with the
+/// ground, never each other). This is deliberate — it makes each batched
+/// creature's physics bit-identical to being evaluated ALONE at the origin,
+/// which is exactly how the gallery bake spawns it. Spacing them out instead
+/// put each creature at a different (and large) coordinate, and floating-point
+/// precision there diverged from the bake for chaotic creatures — so a jumper
+/// scored as a 4m hop would fling to 14m when baked. Coincident spawns kill that
+/// divergence: what's scored is what's shown.
+const BATCH_SPACING: f32 = 0.0;
 
 fn setup_with_graphics(
     mut commands: Commands,
