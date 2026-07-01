@@ -1022,18 +1022,19 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
 
     match fitness_mode() {
         FitnessMode::Distance => {
-            // Ballistic-launch guard: a walker that flies isn't locomoting.
-            if !f.peak_com_height.is_finite() || f.peak_com_height > 5.0 {
+            // Grounded-locomotion guard: keep the COM LOW so we select WALKING,
+            // not bounding/leaping. A tighter cap than before (was 5m) kills the
+            // kangaroo-hop local optimum that competed with proper gaits.
+            if !f.peak_com_height.is_finite() || f.peak_com_height > 2.0 {
                 return 0.0;
             }
             let horizontal = Vec2::new(f.end_pos.x - f.start_pos.x, f.end_pos.z - f.start_pos.z).length();
             let speed = (horizontal / f.duration.max(1.0)).max(0.0);
-            // Mild complexity bonus (EXPLORATORY): a 2-box inchworm is a strong
-            // local optimum because simple bodies are easy to make move. Nudge
-            // selection toward richer morphologies by rewarding extra parts a
-            // little — capped so it nudges exploration without paying for pure
-            // bloat. +4% per part beyond the first, up to +24% at 7 parts.
-            let bonus = 1.0 + 0.04 * f.part_count.saturating_sub(1).min(6) as f32;
+            // Complexity bonus: a 2-box inchworm is a strong local optimum because
+            // simple bodies are easy to make move. Reward extra parts to nudge
+            // selection toward richer, leggier morphologies — capped so it favours
+            // exploration without paying for pure bloat. +6%/part up to +36% at 7.
+            let bonus = 1.0 + 0.06 * f.part_count.saturating_sub(1).min(6) as f32;
             speed * bonus
         }
         FitnessMode::Jump => {
