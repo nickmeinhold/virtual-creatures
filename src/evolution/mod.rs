@@ -1047,6 +1047,13 @@ pub fn calculate_fitness(f: &FitnessInputs) -> f32 {
             if !f.peak_com_height.is_finite() || f.peak_com_height > 20.0 {
                 return 0.0;
             }
+            // A jump goes UP and lands near where it started — not a ballistic
+            // fling across the arena. Disqualify large horizontal travel so we
+            // select a controlled vertical hop, not a tumbling launch.
+            let horizontal = Vec2::new(f.end_pos.x - f.start_pos.x, f.end_pos.z - f.start_pos.z).length();
+            if horizontal > 3.0 {
+                return 0.0;
+            }
             (f.min_part_floor - f.settle_floor).max(0.0)
         }
         FitnessMode::Spin => {
